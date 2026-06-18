@@ -70,7 +70,7 @@ coverage.xml
 # IDE
 .trae/
 ref/
-docs/ 
+# docs/ 
 .artifacts/
 artifacts/
 source/
