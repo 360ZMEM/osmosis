@@ -1,0 +1,10 @@
+env:
+  disturbance_cfg:
+    mode: jonswap
+    base_vel: [0.06, 0.0, 0.02]
+    jonswap_hs: 0.3
+    jonswap_fp: 0.18
+    jonswap_gamma: 3.3
+    jonswap_depth: 30.0
+    jonswap_direction: 0.0
+    jonswap_seed: 7

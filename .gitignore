@@ -1,0 +1,76 @@
+# EasyUUV-STDW .gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Experiment outputs
+.results/
+.tmp/
+logs/
+runs/
+outputs/
+
+# Per-run training/eval artifacts
+*.jsonl
+!docs/**/*.jsonl
+*.csv
+!docs/**/*.csv
+*.tfevents*
+events.out.tfevents.*
+wandb/
+
+# Checkpoints (large)
+*.pt
+*.pth
+*.jit
+*.onnx
+*.ckpt
+*.safetensors
+
+# Intermediate plots / large media
+*.mp4
+*.mkv
+*.avi
+*.webm
+
+# Large dataset / replay logs (allow listing / sample)
+data/recordings/
+data/replays/
+!data/warpauv/
+
+# Local env / secrets
+.env
+.envrc
+*.local.yaml
+
+# Coverage / pytest
+.coverage
+.pytest_cache/
+htmlcov/
+coverage.xml
+
+# IDE
+.trae/
+ref/
+docs/ 
+.artifacts/
+artifacts/
+source/

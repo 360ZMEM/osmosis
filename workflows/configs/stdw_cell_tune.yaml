@@ -1,0 +1,4 @@
+# STDW C-cell-2: tune_gains=True + 4 mechanisms ON (full meta-control + STDW double envelope)
+env:
+  tune_gains: true
+  identity_init: false

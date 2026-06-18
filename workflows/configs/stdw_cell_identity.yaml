@@ -1,0 +1,4 @@
+# STDW C-cell-1: identity_init=True (meta-control bypassed; equivalent to legacy 4-dim path on 8-dim policy)
+env:
+  tune_gains: true
+  identity_init: true

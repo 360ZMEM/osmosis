@@ -1,0 +1,13 @@
+# 正式规模训练 DR 配置（小幅起步）
+# 通过 --workflow_config 注入 env_cfg.domain_randomization.*
+# 仅覆盖幅度，不动 use_custom_randomization 主开关（默认 True）
+env:
+  domain_randomization:
+    com_to_cob_offset_xyz_range: [0.02, 0.02, 0.02]
+    mass_scale_range: [0.95, 1.05]
+    inertia_scale_range:
+      - [0.95, 1.05]
+      - [0.95, 1.05]
+      - [0.95, 1.05]
+    drag_multiplier_scale_range: [0.9, 1.1]
+    dyn_time_constant_scale_range: [0.9, 1.1]

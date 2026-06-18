@@ -1,0 +1,75 @@
+# @file eval/deploy_config.yaml
+# @brief 实物部署集中配置（Isaac 独立）。所有实物部署参数都在此文件控制，
+#        而非散落在命令行。仿真主体代码不读取此文件。
+#
+# 用法：
+#   from easyuuv_stdw.eval.deploy_config import load_deploy_config
+#   cfg = load_deploy_config("eval/deploy_config.yaml")
+#
+# 注意：
+#   - 本文件不含任何 Isaac / omni.kit 依赖。
+#   - 缺失字段会回落到 deploy_config.py 中的 dataclass 默认值。
+
+# ---- 串口 / 硬件桥 ----
+serial:
+  # TODO(deploy): 改成你的实际串口。Linux 通常是 /dev/ttyUSB0，Windows 是 COMx。
+  port: /dev/ttyUSB0
+  baudrate: 115200
+  timeout: 0.05          # s, 读超时
+  write_timeout: 0.05    # s, 写超时
+  enabled: false         # false=dry-run（不打开串口，便于无硬件自检）
+
+# ---- 控制循环 ----
+control:
+  control_dt: 0.00625    # s, = 1/160，与 example_LLM.py 一致
+  steps_per_action: 240  # 每个 action 维持的物理子步数
+  # roll / pitch / yaw 是否参与控制（与 example_LLM.py control_mode 对齐）
+  control_mode: [false, false, true]
+  # 单步动作映射到角度增量的上限（rad），含符号；第三维 yaw 为主控
+  action_limit_rpy: [0.0, 0.0, -0.34]
+
+# ---- S 面控制器初值（ζ1 主，ζ2 D 项次要）----
+controller:
+  # 每个自由度 [zeta1, zeta2]
+  roll_zeta:  [0.25, 0.0]
+  pitch_zeta: [0.40, 0.2]
+  yaw_zeta:   [0.10, 0.0]
+  s_ratio: 1.0           # S 面斜率系数 s（见 _pid_control）
+
+# ---- 策略 ----
+policy:
+  # TODO(deploy): 指向导出的 *_deploy.jit（由 play_stdw_adapt.py --export_deploy_jit True 生成）
+  model_path: ./logs/deploy/stdw_step_001499_deploy.jit
+  obs_layout: a3_12d     # 当前 A3 参数化策略；与训练特征顺序一致
+  device: cpu            # 板载一般无 GPU
+
+# ---- STDW 在线少样本自适应 ----
+stdw:
+  enable: false          # 实物默认关闭，确认基线无误后再开
+  min_real_samples: 64   # STDW 慢环触发所需的最小实物样本数（强调极少样本）
+  slow_loop_interval: 120
+  g_C_lr: 5.0e-5
+  # micro-probe（observable-only 系统辨识）
+  micro_probe:
+    enable: false
+    start_step: 200
+    window_steps: 60
+    settle_steps: 20
+    axes: [0, 1]
+    magnitude: 0.02
+    score_mode: paired_axis
+
+# ---- 参考信号 / 目标 ----
+goal:
+  # 离散目标序列：每项 [roll, pitch, yaw]（rad）
+  sequence:
+    - [0.0, 0.0, 0.0]
+    - [0.0, 0.0, 1.2566]   # ~pi/2.5
+    - [0.0, 0.0, 0.0]
+    - [0.0, 0.0, -1.2566]
+    - [0.0, 0.0, 0.0]
+  # 正弦目标（启用时覆盖 sequence 的 yaw）
+  sine:
+    enable: false
+    amplitude: 1.0472      # ~pi/3 rad
+    period: 10.0           # s
