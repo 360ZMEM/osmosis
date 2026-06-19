@@ -108,6 +108,13 @@ def main():
                     help="TAG 开关，透传到每个 cell 的 play_stdw_adapt.py")
     ap.add_argument("--trigger_threshold", type=float, default=0.05,
                     help="TAG 阈值 (rad)，透传到每个 cell")
+    ap.add_argument("--deterministic_reference", default="False",
+                    help="把 desired 轨迹与全局 RNG 解耦，使每个 off/on 配对在同 "
+                         "seed 下共享同一参考轨迹（公平 overlay / 公平 ΔMSE）。"
+                         "透传到每个 cell 的 play_stdw_adapt.py。")
+    ap.add_argument("--resume", action="store_true",
+                    help="跳过已成功（cell 内已存在 summary.json）的 cell，只重跑"
+                         "缺失/失败的 cell。用于在 flaky 资产拉取失败后补跑。")
     args = ap.parse_args()
 
     out_root: Path = args.out_root
@@ -138,6 +145,27 @@ def main():
         cell_dir.mkdir(parents=True, exist_ok=True)
         log_path = cell_dir / "run.log"
 
+        if args.resume:
+            existing = _find_summary(cell_dir)
+            if existing:
+                print(f"[{i:3d}/{n}] {cell_id}  [SKIP: already has summary.json]")
+                row = {
+                    "cell_id": cell_id, "wave": wave, "embodiment": emb,
+                    "tune": tune, "stdw": stdw, "seed": seed,
+                    "returncode": 0, "wall_seconds": 0.0,
+                    "final_mse": existing.get("final_mse"),
+                    "final_mse_after_drift": existing.get("final_mse_after_drift"),
+                    "convergence_step": existing.get("convergence_step"),
+                    "use_stdw": existing.get("use_stdw"),
+                    "target_drift": existing.get("target_drift"),
+                    "embodiment_summary": existing.get("embodiment"),
+                    "gate_silenced_count": existing.get("gate_silenced_count"),
+                }
+                rows.append(row)
+                succ += 1
+                _flush(rows, out_root)
+                continue
+
         cfg_yaml = CONFIG_DIR / f"matrix_wave_{wave}_{tune}.yaml"
         if not cfg_yaml.is_file():
             print(f"[FAIL] {cell_id}: missing yaml {cfg_yaml}")
@@ -165,6 +193,7 @@ def main():
             "--target_drift", str(target_drift),
             "--enable_trigger_gate", str(args.enable_trigger_gate),
             "--trigger_threshold", str(args.trigger_threshold),
+            "--deterministic_reference", str(args.deterministic_reference),
             "--total_steps", str(args.total_steps),
             "--seed", str(seed),
             "--results_root", str(cell_dir / "results"),
