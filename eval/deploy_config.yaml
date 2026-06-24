@@ -15,13 +15,13 @@ serial:
   # TODO(deploy): 改成你的实际串口。Linux 通常是 /dev/ttyUSB0，Windows 是 COMx。
   port: /dev/ttyUSB0
   baudrate: 115200
-  timeout: 0.05          # s, 读超时
-  write_timeout: 0.05    # s, 写超时
-  enabled: false         # false=dry-run（不打开串口，便于无硬件自检）
+  timeout: 0.05          # 秒，读超时
+  write_timeout: 0.05    # 秒，写超时
+  enabled: false         # false 表示 dry-run（不打开串口，便于无硬件自检）
 
 # ---- 控制循环 ----
 control:
-  control_dt: 0.00625    # s, = 1/160，与 example_LLM.py 一致
+  control_dt: 0.00625    # 秒，= 1/160，与 example_LLM.py 一致
   steps_per_action: 240  # 每个 action 维持的物理子步数
   # roll / pitch / yaw 是否参与控制（与 example_LLM.py control_mode 对齐）
   control_mode: [false, false, true]
@@ -49,7 +49,7 @@ stdw:
   min_real_samples: 64   # STDW 慢环触发所需的最小实物样本数（强调极少样本）
   slow_loop_interval: 120
   g_C_lr: 5.0e-5
-  # micro-probe（observable-only 系统辨识）
+  # micro-probe（仅依赖可观测量的系统辨识）
   micro_probe:
     enable: false
     start_step: 200
@@ -72,4 +72,4 @@ goal:
   sine:
     enable: false
     amplitude: 1.0472      # ~pi/3 rad
-    period: 10.0           # s
+    period: 10.0           # 秒

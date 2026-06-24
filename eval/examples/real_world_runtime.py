@@ -1,9 +1,9 @@
 """@file eval/examples/real_world_runtime.py
-@brief Isaac-independent real-world runtime skeleton for STDW/A3 deployment.
+@brief 面向 STDW/A3 部署的 Isaac 独立实物运行骨架。
 
-This example follows the practical structure of ``real_world_ref/example_LLM.py``
-but removes Isaac/OpenAI assumptions.  It can run in dry-run mode on a laptop,
-or open a serial port when ``serial.enabled: true`` in deploy_config.yaml.
+本示例沿用 ``real_world_ref/example_LLM.py`` 的实用结构，但移除了 Isaac/OpenAI 假设。
+它可以在笔记本上以 dry-run 模式运行，也可以在 deploy_config.yaml 中设置
+``serial.enabled: true`` 后打开串口。
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ def _wrap_pi(angle: float) -> float:
 
 
 def _quat_from_euler_xyz(roll: float, pitch: float, yaw: float) -> np.ndarray:
-    """Return w-x-y-z quaternion from roll/pitch/yaw radians."""
+    """由 roll/pitch/yaw（弧度）返回 w-x-y-z 四元数。"""
     cr, sr = math.cos(roll * 0.5), math.sin(roll * 0.5)
     cp, sp = math.cos(pitch * 0.5), math.sin(pitch * 0.5)
     cy, sy = math.cos(yaw * 0.5), math.sin(yaw * 0.5)
@@ -40,7 +40,7 @@ def _quat_from_euler_xyz(roll: float, pitch: float, yaw: float) -> np.ndarray:
 
 
 def _euler_xyz_from_quat(q: np.ndarray) -> tuple[float, float, float]:
-    """Return roll/pitch/yaw radians from w-x-y-z quaternion."""
+    """由 w-x-y-z 四元数返回 roll/pitch/yaw（弧度）。"""
     w, x, y, z = [float(v) for v in q]
     sinr_cosp = 2.0 * (w * x + y * z)
     cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
@@ -54,7 +54,7 @@ def _euler_xyz_from_quat(q: np.ndarray) -> tuple[float, float, float]:
 
 
 def parse_part(part_str: str) -> dict[str, Optional[float]]:
-    """Parse one ESP32 IMU part containing P/R/Y tokens."""
+    """解析一个包含 P/R/Y token 的 ESP32 IMU 片段。"""
     result: dict[str, Optional[float]] = {"P": None, "R": None, "Y": None}
     for elem in part_str.strip().split():
         if not re.match(r"^[PRY]:", elem):
@@ -68,7 +68,7 @@ def parse_part(part_str: str) -> dict[str, Optional[float]]:
 
 
 def parse_all_parts(data_str: str) -> list[dict[str, Optional[float]]]:
-    """Parse the existing ESP32 format: ``P:.. R:.. Y:.. | ... | ...``."""
+    """解析现有 ESP32 格式：``P:.. R:.. Y:.. | ... | ...``。"""
     parts = data_str.strip().split("|")[:3]
     parsed = [parse_part(part) for part in parts]
     while len(parsed) < 3:
@@ -87,7 +87,7 @@ class RuntimeState:
 
 
 class RealWorldEnv:
-    """Minimal serial bridge that produces the eval/wrappers.py state contract."""
+    """最小串口 bridge，产出 eval/wrappers.py 要求的 state 契约。"""
 
     def __init__(self, cfg: DeployConfig):
         self.cfg = cfg
@@ -105,7 +105,7 @@ class RealWorldEnv:
         if cfg.serial.enabled:
             try:
                 import serial  # type: ignore
-            except ImportError as exc:  # pragma: no cover - hardware host only
+            except ImportError as exc:  # pragma: no cover - 仅硬件主机路径
                 raise ImportError("pyserial is required when serial.enabled=true; install with `pip install pyserial`.") from exc
             self.ser = serial.Serial(
                 cfg.serial.port,
@@ -116,16 +116,16 @@ class RealWorldEnv:
             self.ser.reset_input_buffer()
 
     def reset(self) -> np.ndarray:
-        """Activate hardware if serial is enabled and return initial obs."""
+        """若启用串口则激活硬件，并返回初始 obs。"""
         if self.ser is not None:
-            # TODO(deploy): Confirm 'a' is the activation command for your ESP32 firmware.
+            # TODO(deploy): 确认 'a' 是否为当前 ESP32 固件的激活命令。
             self.ser.write(b"a")
             time.sleep(1.0)
         self.position_update()
         return self.get_obs()
 
     def position_update(self) -> bool:
-        """Read one IMU line and update quaternion + angular velocity estimate."""
+        """读取一行 IMU 数据，并更新四元数与角速度估计。"""
         if self.ser is None:
             return True
         raw_line = self.ser.readline()
@@ -146,23 +146,23 @@ class RealWorldEnv:
             self.state.orientation_quat = _quat_from_euler_xyz(float(rpy[0]), float(rpy[1]), float(rpy[2]))
             return True
         except Exception:
-            # TODO(deploy): Replace with structured logging on the vehicle.
+            # TODO(deploy): 上板时替换为结构化日志。
             return False
 
     def get_obs(self) -> np.ndarray:
-        """Return the current A3 12-D policy observation."""
+        """返回当前 A3 12D 策略观测。"""
         self.position_update()
         return obs_from_state(self.state.__dict__, layout=self.cfg.policy.obs_layout)
 
     def step(self, action: np.ndarray) -> np.ndarray:
-        """Apply one policy action through the serial command protocol."""
+        """通过串口命令协议应用一次策略动作。"""
         ctrl = np.clip(np.asarray(action, dtype=np.float32)[:3], -1.0, 1.0)
         action_limit = np.asarray(self.cfg.control.action_limit_rpy, dtype=np.float32)
         roll, pitch, yaw = _euler_xyz_from_quat(self.state.orientation_quat)
         desired = np.array([roll, pitch, yaw], dtype=np.float32) + ctrl * action_limit
         desired = np.array([_wrap_pi(float(v)) for v in desired], dtype=np.float32)
         if self.ser is not None:
-            # TODO(deploy): Confirm command units/sign conventions with the ESP32 firmware.
+            # TODO(deploy): 与 ESP32 固件确认命令单位和符号约定。
             deg = desired * 180.0 / math.pi
             self.ser.write(f"r{deg[0]:.2f}p{deg[1]:.2f}y{deg[2]:.2f}".encode("utf-8"))
         else:
@@ -170,14 +170,14 @@ class RealWorldEnv:
         return self.get_obs()
 
     def halt(self) -> None:
-        """Send emergency stop to the low-level board when available."""
+        """可用时向低层控制板发送急停命令。"""
         if self.ser is not None:
-            # TODO(deploy): Confirm 'e' is the emergency stop command.
+            # TODO(deploy): 确认 'e' 是否为急停命令。
             self.ser.write(b"e")
 
 
 class ZeroPolicy:
-    """Dry-run fallback when no deploy policy has been copied yet."""
+    """尚未拷贝部署策略时的 dry-run 零动作 fallback。"""
 
     backend = "zero-dry-run"
 
@@ -202,8 +202,8 @@ def main() -> None:
     if policy_path.is_file():
         policy = Policy(policy_path, device=cfg.policy.device)
     elif not cfg.serial.enabled:
-        # Dry-run should work before a deploy JIT is copied to the vehicle host.
-        # TODO(deploy): Replace the YAML model_path with a real *_deploy.jit before wet testing.
+        # 拷贝部署 JIT 到板载主机前，dry-run 仍应可运行。
+        # TODO(deploy): 湿测前将 YAML model_path 替换为真实 *_deploy.jit。
         print(f"[WARN] policy not found: {policy_path}; using zero-action dry-run policy.")
         policy = ZeroPolicy()
     else:

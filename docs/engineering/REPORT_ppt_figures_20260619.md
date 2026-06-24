@@ -135,6 +135,40 @@
 
 ---
 
+## 代价分析：STDW 一次有效更新的算力开销（fig29）
+
+> 这一张**不是实验结果图**，而是回答「STDW 在线自适应的代价是什么、能否上端侧」。量化的是**一次有效慢环更新**（forward + backward + optimizer.step）相对于**部署时每步都要跑的快环推理**的额外算力，并对照 60 Hz 控制周期的实时预算。
+
+**一次有效更新**严格复刻 [play_stdw_adapt.py](../../workflows/play_stdw_adapt.py#L1492-L1563) 的慢环：2 次带梯度 actor 前向（B=256）+ 2 次冻结 `policy_ref` 前向（no_grad anchor）+ behavior-KL 正则 + `loss.backward()` + `clip_grad_norm_(1.0)` + `Adam(lr=5e-5).step()`。网络/超参取自 [rsl_rl_ppo_cfg.py](../../agents/rsl_rl_ppo_cfg.py#L53-L61)（`EasyUUVParametricPPORunnerCfg`：actor/critic 均 `12→128→128→{8,1}`，ELU）与 CLI 默认（`batch_size=256`、`slow_loop_interval=60`、`lambda_reg=1e-3`、`reg_mode=behavior_kl`）。`empirical_normalization=False`，故归一化是恒等映射、无额外开销。
+
+![fig29 STDW 更新算力代价](../figures/ppt/fig29_stdw_update_cost.png)
+
+**实测数据**（torch 2.2.2+cu118，RTX 4060 Laptop GPU；CPU=16 线程主机，单线程作为端侧 MCU 代理）：
+
+| 指标 | 数值 |
+|---|---|
+| 部署网络（actor） | MLP 12-128-128-8（ELU），**19,208** 参数 |
+| 单步推理算力 / 时延 | 37.9 kFLOP / 约 44 µs (GPU)、18 µs (CPU) |
+| 一次更新可训练参数（Adam over `policy.parameters()`） | **37,521** |
+| 一次更新算力（含 backward 估计） | **约 78 MFLOP**（≈ 一次推理的 **2048×**） |
+| 一次更新峰值显存增量 | **+2.8 MiB** |
+| 一次更新墙钟（GPU / CPU-16线程 / CPU-单线程） | **0.94 ms / 2.16 ms / 1.54 ms** |
+| 触发频率 | ≤ 1 次/秒（受 trigger gate 限制；实测约 20 次/episode） |
+| 最坏占空比（更新时间 / 总时间） | **约 0.22%** |
+
+**端侧友好性结论**：
+
+1. **绝对时延极小**：最慢的情形（CPU 单线程）一次更新也只要 ~1.5 ms，**远低于 60 Hz 控制周期的 16.67 ms 预算**——即便把更新塞进控制循环也不会错过 deadline；图中红色虚线即该预算上限，所有更新柱都压在它下方一个量级。
+2. **频率极低、占空比可忽略**：慢环最多 1 次/秒且受门控约束，最坏占空比仅 ~0.22%，控制器 99.8% 的算力仍服务于快环推理。
+3. **内存/参数足迹小**：网络不足 2 万参数、更新峰值显存 +2.8 MiB，Adam 的一阶/二阶动量也只对应 ~3.75 万参数；可轻松放进 MCU/嵌入式 SoC 的 SRAM/片上内存。
+4. **CPU 单线程比 16 线程更快**：批量仅 256、网络极小，多线程的同步开销反而拖慢，单线程路径更贴合端侧无 GPU 部署，且无需线程池——进一步利好嵌入式落地。
+
+> 一句话：STDW 的在线更新代价是「每秒一次、约 1–2 ms、约 78 MFLOP、+3 MiB」的轻量级 fine-tune，相对端侧本就要跑的快环推理只是**周期性的小额外支出**，对端侧部署友好。
+
+- 数据源：[`.results/stdw_update_cost/stdw_update_cost.json`](../../.results/stdw_update_cost/stdw_update_cost.json)；测量脚本 [workflows/tools/bench_stdw_update_cost.py](../../workflows/tools/bench_stdw_update_cost.py)；绘图 [`plot_ppt_figures.py --cost_only`](../../workflows/tools/plot_ppt_figures.py)。
+
+---
+
 ## 复现命令
 
 ```bash
@@ -158,6 +192,16 @@ bash workflows/run_misset_online.sh
 cd workflows/tools && python3 plot_ppt_figures.py --misset_only
 ```
 
+算力代价分析（fig29，不覆盖主图）：
+
+```bash
+cd /home/zmem063/isaaclab/source/extensions/omni.isaac.lab_tasks/omni/isaac/lab_tasks/direct/easyuuv_stdw
+# 1) 测量一次有效更新 vs 单步推理的算力代价（写 JSON）
+python3 workflows/tools/bench_stdw_update_cost.py --warmup 30 --iters 400
+# 2) 仅重画 fig29（不触碰其它图）
+cd workflows/tools && python3 plot_ppt_figures.py --cost_only
+```
+
 ## 文件清单
 
 | 图 | 文件 | 幻灯片定位 |
@@ -168,3 +212,4 @@ cd workflows/tools && python3 plot_ppt_figures.py --misset_only
 | 图 2.4 | `fig24_publication_overlay.{png,pdf}` | Slide 6 / Slide 9 中部 |
 | 附图 | `fig25/fig26/fig27_*.{png,pdf}` | Slide 6 / Slide 10 补充 |
 | 支线 | `fig28_misset_online_{base,heavy_moderate}.{png,pdf}` | Slide 9/10 补充（错设控制器在线恢复） |
+| 代价 | `fig29_stdw_update_cost.{png,pdf}` | Slide 10 补充（更新算力代价 / 端侧友好性） |

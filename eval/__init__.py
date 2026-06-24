@@ -1,16 +1,14 @@
 """@file eval/__init__.py
-@brief Isaac-Lab-independent evaluation utilities for EasyUUV STDW policies.
+@brief EasyUUV STDW 策略的 Isaac Lab 独立评估工具。
 @details
-  This subpackage holds everything needed to run a trained EasyUUV policy
-  outside Isaac Sim:
-    - wrappers.py       state<->obs / reward (pure numpy/torch)
-    - policy_loader.py  pt / jit / onnx loader (auto-dispatch by suffix)
-    - train_loop.py     reference PPO loop (no rsl_rl, no Isaac)
-    - deploy_eval.py    CLI: load ckpt + replay -> metrics
-    - examples/         minimal demo scripts
+  本子包包含在 Isaac Sim 之外运行已训练 EasyUUV 策略所需的最小组件：
+    - wrappers.py       state<->obs / reward 转换（纯 numpy/torch）
+    - policy_loader.py  pt / jit / onnx 加载器（按后缀自动分派）
+    - train_loop.py     参考 PPO 循环（不依赖 rsl_rl 和 Isaac）
+    - deploy_eval.py    CLI：加载 ckpt + replay -> 指标
+    - examples/         最小示例脚本
 
-  This module deliberately does NOT import omni.isaac.* so it can run on a
-  vehicle's onboard computer or in a CI container.
+  本模块刻意不导入 omni.isaac.*，因此可在板载计算机或 CI 容器中运行。
 """
 
 from .wrappers import obs_from_state, reward_from_state  # noqa: F401

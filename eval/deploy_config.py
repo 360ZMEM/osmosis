@@ -1,9 +1,9 @@
 """@file eval/deploy_config.py
-@brief Isaac-independent deployment configuration loader.
+@brief Isaac 独立部署配置加载器。
 
-This module keeps real-world deployment parameters out of command-line-only
-examples.  It intentionally imports no Isaac / omni / rsl_rl modules, so it can
-run on a vehicle host with only Python, numpy, torch, and optionally pyyaml.
+本模块把实物部署参数集中放在配置文件中，避免散落到命令行示例里。
+它刻意不导入 Isaac / omni / rsl_rl 模块，因此只依赖 Python、numpy、torch
+以及可选的 pyyaml 就能在板载主机运行。
 """
 
 from __future__ import annotations
@@ -100,7 +100,7 @@ class DeployConfig:
 
 
 def _merge_dataclass(obj: Any, data: Mapping[str, Any]) -> Any:
-    """Merge a nested mapping into a dataclass object in-place."""
+    """将嵌套 mapping 原地合并到 dataclass 对象中。"""
     for key, value in data.items():
         if not hasattr(obj, key):
             raise KeyError(f"unknown deploy config key: {key}")
@@ -113,11 +113,10 @@ def _merge_dataclass(obj: Any, data: Mapping[str, Any]) -> Any:
 
 
 def load_deploy_config(path: str | Path | None = None) -> DeployConfig:
-    """Load deployment YAML and merge it over dataclass defaults.
+    """加载部署 YAML，并覆盖 dataclass 默认值。
 
-    Missing YAML fields are intentionally allowed; unknown fields fail fast so
-    a typo in a deployment parameter does not silently change real hardware
-    behavior.
+    YAML 中缺失字段会保留默认值；未知字段会立即报错，避免部署参数拼写错误
+    静默改变真实硬件行为。
     """
     cfg = DeployConfig()
     cfg_path = Path(path).expanduser() if path else DEFAULT_CONFIG_PATH
@@ -126,7 +125,7 @@ def load_deploy_config(path: str | Path | None = None) -> DeployConfig:
 
     try:
         import yaml
-    except ImportError as exc:  # pragma: no cover - depends on host image
+    except ImportError as exc:  # pragma: no cover - 取决于板载/主机镜像
         raise ImportError("pyyaml is required to read deploy_config.yaml; install with `pip install pyyaml`.") from exc
 
     with cfg_path.open("r", encoding="utf-8") as f:

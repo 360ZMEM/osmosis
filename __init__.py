@@ -8,8 +8,8 @@
 @file __init__.py
 @brief Gym registration entry for EasyUUV-Direct-v1 (4D baseline) and
        EasyUUV-Direct-Parametric-v1 (8D meta-control).
-@details See docs/INDEX.md for the documentation tree, docs/guide/COMMAND_CONTRACT.md
-         for runnable commands, and docs/guide/AGENT_HANDOFF.md for the AI continuation
+@details See docs/INDEX.md for the documentation tree, docs/COMMAND_CONTRACT.md
+         for runnable commands, and docs/AGENT_HANDOFF.md for the AI continuation
          brief.
 """
 
@@ -22,7 +22,8 @@ except ModuleNotFoundError as exc:
     # Keep easyuuv_stdw.eval importable on onboard computers that do not ship
     # Isaac Sim / omni.kit.  Environment registration is only needed inside
     # Isaac Lab workflows.
-    if not str(exc).startswith("No module named 'omni"):
+    missing_name = getattr(exc, "name", "")
+    if missing_name not in {"gymnasium"} and not str(missing_name).startswith("omni"):
         raise
     gym = None
     agents = None

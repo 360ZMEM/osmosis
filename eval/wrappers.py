@@ -1,18 +1,18 @@
 """@file eval/wrappers.py
-@brief State <-> observation / reward wrappers (Isaac-independent).
+@brief 状态 <-> 观测 / reward 转换 wrapper（Isaac 独立）。
 
-State dict contract (must be produced by your hardware bridge):
-  position           : np.ndarray (3,)   [m]    world frame
+状态字典契约（必须由硬件 bridge 产出）：
+  position           : np.ndarray (3,)   [m]    世界坐标系
   orientation_quat   : np.ndarray (4,)   [w,x,y,z]
-  linear_velocity_b  : np.ndarray (3,)   [m/s]  body frame
-  angular_velocity_b : np.ndarray (3,)   [rad/s] body frame
+  linear_velocity_b  : np.ndarray (3,)   [m/s]  机体坐标系
+  angular_velocity_b : np.ndarray (3,)   [rad/s] 机体坐标系
   goal_position      : np.ndarray (3,)   [m]
   goal_yaw           : float             [rad]
 
-Two observation layouts are supported:
-  a3_12d      : current parametric EasyUUV A3 policy
+支持两种观测布局：
+  a3_12d      : 当前 EasyUUV A3 参数化策略
                 [goal_quat(4), depth_z(1), root_quat(4), angular_velocity_b(3)]
-  legacy_10d  : older Isaac-independent demo layout
+  legacy_10d  : 较早的 Isaac 独立 demo 布局
                 [pos_err(3), yaw_err(1), linear_velocity_b(3), angular_velocity_b(3)]
 """
 
@@ -24,7 +24,7 @@ from typing import Dict
 import numpy as np
 
 
-# Observation layout (must match training-time feature order).
+# 观测布局必须与训练时特征顺序一致。
 _OBS_KEYS_LEGACY_10D = (
     "pos_err_x", "pos_err_y", "pos_err_z",
     "yaw_err",
@@ -45,7 +45,7 @@ ACT_DIM_PARAMETRIC = 8
 
 
 def _quat_to_yaw(quat_wxyz: np.ndarray) -> float:
-    """Extract yaw (rotation about world Z) from a w-x-y-z quaternion."""
+    """从 w-x-y-z 四元数中提取 yaw（绕世界 Z 轴旋转）。"""
     w, x, y, z = float(quat_wxyz[0]), float(quat_wxyz[1]), float(quat_wxyz[2]), float(quat_wxyz[3])
     siny_cosp = 2.0 * (w * z + x * y)
     cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
@@ -62,9 +62,9 @@ def _yaw_to_quat_wxyz(yaw: float) -> np.ndarray:
 
 
 def obs_from_state(state: Dict[str, np.ndarray], *, layout: str = "a3_12d") -> np.ndarray:
-    """@brief Build an observation from a hardware state dict.
-    @param layout "a3_12d" for current A3 parametric policy or "legacy_10d".
-    @return np.ndarray shape (12,) or (10,), dtype float32.
+    """@brief 从硬件 state dict 构造策略观测。
+    @param layout 当前 A3 参数化策略使用 "a3_12d"，旧 demo 使用 "legacy_10d"。
+    @return np.ndarray，shape 为 (12,) 或 (10,)，dtype 为 float32。
     """
     layout = str(layout).lower()
     if layout in {"a3", "a3_12d", "parametric_12d"}:
@@ -94,13 +94,13 @@ def obs_from_state(state: Dict[str, np.ndarray], *, layout: str = "a3_12d") -> n
 
 
 def reward_from_state(state: Dict[str, np.ndarray], action: np.ndarray) -> float:
-    """@brief Reference reward shaping (must match training cfg).
-    @param state Same dict as obs_from_state.
-    @param action Last action np.ndarray (4 or 8,).
-    @return Scalar reward.
+    """@brief 参考 reward shaping（应与训练配置保持一致）。
+    @param state 与 obs_from_state 相同的 state dict。
+    @param action 上一步动作，np.ndarray shape 为 (4,) 或 (8,)。
+    @return 标量 reward。
     @details
       r = -|pos_err|^2 - 0.5*|yaw_err| - 0.1*|action[:4]|^2 - 0.05*|ang_vel_b|^2
-      The 4 a_gain channels (action[4:8]) are NOT penalised.
+      4 个 a_gain 通道（action[4:8]）不参与惩罚。
     """
     pos = np.asarray(state["position"], dtype=np.float32)
     goal = np.asarray(state["goal_position"], dtype=np.float32)

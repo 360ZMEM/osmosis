@@ -55,8 +55,9 @@ docs 按用途分为四个目录：
 | 2 | [`INTERFACE.md`](guide/INTERFACE.md) | JONSWAP / 整定 / STDW / Embodiment 全部接口能力卡 |
 | 3 | [`EVAL_SOP.md`](guide/EVAL_SOP.md) | Isaac-independent 部署评估 SOP |
 | 4 | [`DEPLOY_SOP_realworld.md`](guide/DEPLOY_SOP_realworld.md) | 实物部署 SOP |
-| 5 | [`ERROR_CASES.md`](guide/ERROR_CASES.md) | 常见调试坑（yaml 注入失效、CUDA / dim mismatch 等） |
-| 6 | [`AGENT_HANDOFF.md`](guide/AGENT_HANDOFF.md) | **AI 续接指令** — 新 agent 接手时的最短重启包 |
+| 5 | [`CLEAN_ENV_STDW_FOSSEN_DEMO.md`](guide/CLEAN_ENV_STDW_FOSSEN_DEMO.md) | 干净 Python 环境 + Fossen 6-DOF 虚拟实物的最小部署链路教程 |
+| 6 | [`ERROR_CASES.md`](guide/ERROR_CASES.md) | 常见调试坑（yaml 注入失效、CUDA / dim mismatch 等） |
+| 7 | [`AGENT_HANDOFF.md`](guide/AGENT_HANDOFF.md) | **AI 续接指令** — 新 agent 接手时的最短重启包 |
 
 ---
 

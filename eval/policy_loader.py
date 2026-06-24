@@ -1,16 +1,16 @@
 """@file eval/policy_loader.py
-@brief Backend-agnostic policy loader for deployment / replay evaluation.
+@brief 面向部署 / replay 评估的后端无关策略加载器。
 
-Supported model formats (auto-dispatched by file extension):
+支持的模型格式（按文件后缀自动分派）：
   .pt   -> torch.load (full nn.Module pickle, eval())
   .jit  -> torch.jit.load (TorchScript, eval())
-  .onnx -> onnxruntime.InferenceSession (lazy import; CPU provider)
+  .onnx -> onnxruntime.InferenceSession（懒加载；CPU provider）
 
-Contract:
+接口契约：
   Policy(model_path).act(obs_np: np.ndarray (OBS_DIM,)) -> np.ndarray (4,) or (8,)
 
-The wrapper deliberately does NOT depend on `omni.isaac.*`, `rsl_rl`, or
-`gymnasium`; any host with `numpy + torch (or onnxruntime)` can run it.
+本 wrapper 刻意不依赖 `omni.isaac.*`、`rsl_rl` 或 `gymnasium`；
+任何具备 `numpy + torch`（或 onnxruntime）的主机都可运行。
 """
 
 from __future__ import annotations
@@ -23,12 +23,11 @@ import numpy as np
 
 
 class Policy:
-    """@brief Unified policy front-end.
+    """@brief 统一策略前端。
 
     @details
-      Internally caches a single backend handle (torch module or ORT session).
-      Single-sample inference only; for batched evaluation prefer calling
-      `act_batch` (broadcasts a (N, OBS_DIM) array).
+      内部缓存一个后端句柄（torch module 或 ORT session）。
+      单样本推理使用 `act`；批量评估优先调用 `act_batch`（输入 (N, OBS_DIM) 数组）。
     """
 
     def __init__(self, model_path: str | os.PathLike, *, device: str = "cpu"):
@@ -52,10 +51,10 @@ class Policy:
                 f"unsupported policy extension '{suffix}' (expect .pt/.pth/.jit/.ts/.onnx)"
             )
 
-    # ------------------------------------------------------------------ load
+    # ------------------------------------------------------------------ 加载
 
     def _load_torch_pickle(self):
-        import torch  # local import keeps onnx-only deployment lean
+        import torch  # 局部导入，保持 onnx-only 部署路径轻量
         obj = torch.load(self.model_path, map_location=self.device, weights_only=False)
         if isinstance(obj, dict) and "model_state_dict" in obj:
             raise ValueError(
@@ -89,10 +88,10 @@ class Policy:
         self._ort_output = sess.get_outputs()[0].name
         return sess
 
-    # ------------------------------------------------------------------- act
+    # ------------------------------------------------------------------- 推理
 
     def act(self, obs: np.ndarray) -> np.ndarray:
-        """@brief Single-sample inference.
+        """@brief 单样本推理。
         @param obs np.ndarray shape (OBS_DIM,) float32.
         @return np.ndarray shape (ACT_DIM,) float32.
         """
@@ -101,13 +100,13 @@ class Policy:
         return action.reshape(-1)
 
     def act_batch(self, obs: np.ndarray) -> np.ndarray:
-        """@brief Batched inference, obs shape (N, OBS_DIM)."""
+        """@brief 批量推理，obs shape 为 (N, OBS_DIM)。"""
         obs = np.asarray(obs, dtype=np.float32)
         if obs.ndim != 2:
             raise ValueError(f"act_batch expects 2D obs, got shape {obs.shape}")
         return self._forward(obs)
 
-    # ------------------------------------------------------------- internals
+    # ------------------------------------------------------------- 内部实现
 
     def _forward(self, obs_2d: np.ndarray) -> np.ndarray:
         if self._backend in ("torch", "torchscript"):
@@ -117,21 +116,21 @@ class Policy:
                 out = self._handle(tensor)
                 if isinstance(out, (tuple, list)):
                     out = out[0]
-                if not isinstance(out, torch.Tensor) and hasattr(out, "mean"):  # rsl_rl ActorCritic returns Distribution
+                if not isinstance(out, torch.Tensor) and hasattr(out, "mean"):  # rsl_rl ActorCritic 返回 Distribution
                     try:
                         out = out.mean
                     except Exception:
                         pass
                 return out.detach().cpu().numpy().astype(np.float32)
-        # onnx
+        # onnx 后端
         result = self._handle.run([self._ort_output], {self._ort_input: obs_2d})
         return np.asarray(result[0], dtype=np.float32)
 
-    # -------------------------------------------------------- introspection
+    # -------------------------------------------------------- 自省信息
 
     @property
     def backend(self) -> str:
         return self._backend
 
-    def __repr__(self) -> str:  # pragma: no cover
+    def __repr__(self) -> str:  # pragma: no cover - 调试显示
         return f"Policy(path={self.model_path.name}, backend={self._backend})"

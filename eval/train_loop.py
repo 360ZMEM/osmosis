@@ -1,15 +1,14 @@
 """@file eval/train_loop.py
-@brief Minimal reference PPO loop (~50 LOC core), Isaac-independent.
+@brief 最小参考 PPO 循环（核心约 50 行），不依赖 Isaac。
 
-Purpose:
-  Provides a self-contained training reference so that anyone reading the
-  EasyUUV-STDW repo can verify the obs/reward contract without launching
-  Isaac Lab. NOT meant to replace `workflows/train_meta.py` for production.
+用途：
+  提供一个自包含训练参考，使读者无需启动 Isaac Lab 也能验证 obs/reward 契约。
+  它不用于替代生产训练入口 `workflows/train_meta.py`。
 
-Usage:
+用法：
   python -m easyuuv_stdw.eval.train_loop --steps 2000
 
-Required: torch, numpy, gymnasium (or any compatible env factory).
+依赖：torch、numpy、gymnasium（或任意兼容的 env factory）。
 """
 
 from __future__ import annotations
@@ -67,10 +66,10 @@ def gae(rewards, values, dones, gamma, lam):
 
 
 def train(env_factory: Callable, cfg: PPOConfig, total_steps: int = 2000):
-    """@brief Reference PPO loop. Returns trained ActorCritic.
-    @param env_factory  Callable -> gym-like env with reset()/step().
+    """@brief 参考 PPO 循环，返回训练后的 ActorCritic。
+    @param env_factory  Callable -> 类 gym env，需有 reset()/step()。
     @param cfg          PPOConfig.
-    @param total_steps  Total environment steps to collect.
+    @param total_steps  采集的环境总步数。
     """
     env = env_factory()
     net = ActorCritic(cfg)

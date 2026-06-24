@@ -564,13 +564,6 @@ parser.add_argument("--num_envs", type=int, default=1)
 parser.add_argument("--task", type=str, default="EasyUUV-Direct-v1")
 parser.add_argument("--seed", type=int, default=None)
 parser.add_argument("--total_steps", type=int, default=1400)
-parser.add_argument(
-    "--deterministic_reference",
-    type=_bool_arg,
-    default=False,
-    help="Decouple the desired/reference trajectory from the global RNG so STDW "
-    "on/off share an identical reference under the same seed (for fair overlay).",
-)
 
 # STDW gates
 parser.add_argument("--use_stdw", type=_bool_arg, default=True)
@@ -1049,10 +1042,6 @@ def main() -> None:
         _torch.manual_seed(int(args_cli.seed))
         if _torch.cuda.is_available():
             _torch.cuda.manual_seed_all(int(args_cli.seed))
-    # 公平 overlay 模式：把参考轨迹与全局 RNG 解耦（专用 generator 按 seed 复现），
-    # 使 STDW on/off 在相同 seed 下得到逐步一致的 desired 轨迹。
-    if args_cli.deterministic_reference:
-        env_cfg.deterministic_reference = True
     # 仅当 yaml 未在 disturbance_cfg.mode 上明确写入时，才用 CLI 默认值覆盖；
     # 否则 yaml 的 jonswap_* / base_vel 等会被 CLI 默认值整段抹掉。
     yaml_disturbance = (workflow_cfg.get("env") or {}).get("disturbance_cfg") or {}

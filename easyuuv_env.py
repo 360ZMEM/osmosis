@@ -110,10 +110,6 @@ class EasyUUVEnvCfg(DirectRLEnvCfg):
     ref_sine_amp = [0.3, 0.3, 0.3]
     # sine_sweep 逐轴频率 (Hz)：[roll, pitch, yaw]；不同频率避免三轴同相。
     ref_sine_freq = [0.10, 0.13, 0.07]
-    # 评估期把参考轨迹与全局 RNG 解耦：开启后 step 模式的 goal 抽样改用专用
-    # generator（按 seed 复现），使 STDW on/off 在相同 seed 下得到逐步一致的
-    # desired 轨迹，便于公平 overlay 对比；默认 False 不改变训练行为。
-    deterministic_reference = False
 
     class disturbance_cfg:
         mode = "none"
@@ -403,15 +399,6 @@ class EasyUUVEnv(DirectRLEnv):
             self._torque_pulse_generator_device = torch.device("cpu")
         self._torque_pulse_generator.manual_seed(int(getattr(self.cfg, "torque_pulse_seed", 13)))
         self._schedule_next_torque_pulse(torch.arange(self.num_envs, device=self.device), initial=True)
-        # 专用 goal 抽样 generator：仅在 deterministic_reference 时启用，使参考轨迹
-        # 不受 STDW 慢环对全局 RNG 的额外消耗影响，从而 on/off 在相同 seed 下逐步一致。
-        self._goal_generator = None
-        if getattr(self.cfg, "deterministic_reference", False):
-            try:
-                self._goal_generator = torch.Generator(device=self.device)
-            except (TypeError, RuntimeError):
-                self._goal_generator = torch.Generator()
-            self._goal_generator.manual_seed(int(getattr(self.cfg, "seed", 0) or 0))
         self._wave_manager = None
         self._wave_manager_signature = None
 
@@ -651,17 +638,6 @@ class EasyUUVEnv(DirectRLEnv):
             axis_idx = axis_lookup[axis_name]
             param_idx = param_lookup[param_name]
             self.PID_args[target_envs, axis_idx, param_idx] *= float(multiplier)
-
-        # Persist the mis-set gains as the new per-episode baseline. Without this
-        # the multiplier is wiped on the first reset() (restores from
-        # _base_pid_args) and on every physics tick (_apply_action restores all
-        # PID_args columns from _base_pid_args), making the flag a no-op for the
-        # 8D meta-control task.
-        if hasattr(self, "_base_pid_args"):
-            self._base_pid_args = self.PID_args.clone()
-        if getattr(self, "_tune_gains_enabled", False):
-            self._zeta_nominal = self.PID_args[:, :, 0].clone()
-            self._zeta_runtime = self._zeta_nominal.clone()
 
     def apply_embodiment_config(self, embodiment_type: str) -> None:
         """
@@ -1201,29 +1177,14 @@ class EasyUUVEnv(DirectRLEnv):
             # 平滑正弦参考：每个 env 逐轴抽随机相位，episode 内目标由 _update_reference 连续生成。
             ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long) \
                 if not isinstance(env_ids, torch.Tensor) else env_ids
-            gen = getattr(self, "_goal_generator", None)
-            if gen is not None:
-                # 用专用 generator 抽相位，使参考轨迹独立于全局 RNG
-                # （STDW on/off 在相同 seed 下逐步一致，便于公平 overlay）。
-                self._ref_phase[ids] = torch.rand(
-                    (ids.numel(), 3), dtype=torch.float, device=self.device, generator=gen
-                ) * (2.0 * math.pi)
-            else:
-                self._ref_phase[ids] = math_utils.sample_uniform(
-                    0.0, 2.0 * math.pi, (ids.numel(), 3), self.device
-                )
+            self._ref_phase[ids] = math_utils.sample_uniform(
+                0.0, 2.0 * math.pi, (ids.numel(), 3), self.device
+            )
             self._update_reference(ids)
             return
 
         # Get random orientation (step 模式：每个 episode 一个随机姿态硬阶跃)
-        gen = getattr(self, "_goal_generator", None)
-        if gen is not None:
-            # 与 math_utils.random_orientation 等价，但用专用 generator 抽样，
-            # 使参考轨迹独立于全局 RNG（STDW on/off 在相同 seed 下逐步一致）。
-            quat = torch.randn((len(env_ids), 4), dtype=torch.float, device=self.device, generator=gen)
-            self._goal[env_ids, 0:4] = torch.nn.functional.normalize(quat, p=2.0, dim=-1, eps=1e-12)
-        else:
-            self._goal[env_ids, 0:4] = math_utils.random_orientation(len(env_ids), device=self.device)
+        self._goal[env_ids, 0:4] = math_utils.random_orientation(len(env_ids), device=self.device)
 
         # Get random yaw orientation with 0 pitch and roll
         # self._goal[env_ids,0:4] = math_utils.random_yaw_orientation(len(env_ids), device=self.device)

@@ -1,20 +1,17 @@
 """@file eval/examples/thruster_io_demo.py
-@brief Show the 4-D vs 8-D action layout and a reference mapping to physical
-       thruster commands.
+@brief 展示 4D 与 8D 动作布局，以及一个到物理推进器命令的参考映射。
 
-Action contract:
-  Baseline policy (`EasyUUV-Direct-v1`):       action ∈ R^4
-      [u_surge, u_sway, u_heave, u_yaw]   each in [-1, 1]
-  Parametric policy (`EasyUUV-Direct-Parametric-v1`): action ∈ R^8
-      [u_surge, u_sway, u_heave, u_yaw,           # control intent (same as 4-D)
-       a_gain_kp, a_gain_ki, a_gain_kd, a_gain_kff]  # damping-ratio modulation
-                                                    each in [-1, 1] (clipped)
+动作契约：
+  Baseline 策略 (`EasyUUV-Direct-v1`):       action ∈ R^4
+      [u_surge, u_sway, u_heave, u_yaw]   每一维都在 [-1, 1]
+  Parametric 策略 (`EasyUUV-Direct-Parametric-v1`): action ∈ R^8
+      [u_surge, u_sway, u_heave, u_yaw,           # 控制意图（同 4D）
+       a_gain_kp, a_gain_ki, a_gain_kd, a_gain_kff]  # 阻尼比调制
+                                                    每一维都在 [-1, 1]（裁剪后）
 
-The 4 control channels feed the inner PID; the 4 a_gain channels modulate the
-controller damping ratio via a Bounded Safeguard:
+4 个控制通道进入内环 PID；4 个 a_gain 通道通过 Bounded Safeguard 调制控制器阻尼比：
     ζ_i_eff = ζ_i_nom * (1 + β · a_gain_i)
-with β = 0.25 by default; this keeps the closed loop stable while letting the
-policy retune gains under disturbance.
+默认 β = 0.25；该边界在保持闭环稳定的同时，允许策略在扰动下重整定增益。
 """
 
 from __future__ import annotations
@@ -28,24 +25,23 @@ from easyuuv_stdw.eval.deploy_config import DEFAULT_CONFIG_PATH, load_deploy_con
 from easyuuv_stdw.eval.wrappers import ACT_DIM_BASELINE, ACT_DIM_PARAMETRIC
 
 
-# Reference allocation matrix: 4 thruster forces from [surge, sway, heave, yaw].
-# TODO(deploy): Replace this with your real platform's mixer and sign
-# conventions before connecting real thrusters.
+# 参考分配矩阵：由 [surge, sway, heave, yaw] 得到 4 个推进器力。
+# TODO(deploy): 连接真实推进器前，必须替换为实物平台的 mixer 和符号约定。
 THRUSTER_ALLOC = np.array([
-    [ 1.0,  0.0, 0.0,  0.5],   # T0: front-right
-    [ 1.0,  0.0, 0.0, -0.5],   # T1: front-left
-    [ 0.0,  1.0, 1.0,  0.0],   # T2: vertical / sway right
-    [ 0.0, -1.0, 1.0,  0.0],   # T3: vertical / sway left
+    [ 1.0,  0.0, 0.0,  0.5],   # T0: 前右
+    [ 1.0,  0.0, 0.0, -0.5],   # T1: 前左
+    [ 0.0,  1.0, 1.0,  0.0],   # T2: 垂向 / 右侧横移
+    [ 0.0, -1.0, 1.0,  0.0],   # T3: 垂向 / 左侧横移
 ], dtype=np.float32)
 
 
 def to_thruster_cmds(action: np.ndarray) -> np.ndarray:
-    """@brief Map the policy 4-channel control intent to 4 thruster forces.
+    """@brief 将策略的 4 通道控制意图映射为 4 个推进器力。
 
-    @details The a_gain channels from the 8-D parametric policy are ignored
-    here because they tune the low-level controller, not the thruster mixer.
+    @details 这里忽略 8D 参数化策略的 a_gain 通道，因为它们用于整定低层控制器，
+    而不是直接进入推进器 mixer。
     """
-    ctrl = np.clip(np.asarray(action, dtype=np.float32)[:4], -1.0, 1.0)   # ignore a_gain in 8-D
+    ctrl = np.clip(np.asarray(action, dtype=np.float32)[:4], -1.0, 1.0)   # 8D 中忽略 a_gain
     return THRUSTER_ALLOC @ ctrl
 
 
@@ -60,8 +56,7 @@ def main():
     policy_path = args.policy or cfg.policy.model_path
     obs_layout = args.obs_layout or cfg.policy.obs_layout
 
-    # TODO(deploy): Replace this synthetic state with the hardware bridge state
-    # produced from IMU/depth/goal messages.
+    # TODO(deploy): 将合成 state 替换为由 IMU/深度/目标消息生成的硬件 bridge state。
     state = {
         "position":           np.zeros(3, dtype=np.float32),
         "orientation_quat":   np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),

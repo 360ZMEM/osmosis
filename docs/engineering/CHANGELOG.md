@@ -4,6 +4,33 @@
 
 ---
 
+## 2026-06-24 — 干净环境 Fossen 6-DOF 部署链路冒烟
+
+**新增**
+- 在被 `.gitignore` 忽略的 `.results/clean_env_fossen_demo/` 下落地外部样例：
+  `fossen6dof_wrapper.py`、`make_dummy_policy.py`、`run_fossen_chain.py`、
+  `run_clean_smoke.sh`、`requirements-clean.txt`。
+- 新增小白向教程
+  [`docs/guide/CLEAN_ENV_STDW_FOSSEN_DEMO.md`](../guide/CLEAN_ENV_STDW_FOSSEN_DEMO.md)，
+  说明从干净 Python venv 准备依赖、生成 dummy 12D->8D TorchScript 策略、运行
+  Fossen 6-DOF 虚拟实物、产出 replay CSV 并调用 `eval.deploy_eval` 的完整命令链。
+- `docs/INDEX.md` 的用户指南区加入该教程入口。
+
+**修复**
+- `__init__.py` 的顶层 Gym 注册导入改为同时容忍缺少 `gymnasium` 和 `omni.*`。
+  否则在非 IsaacLab 干净环境中执行 `from easyuuv_stdw.eval import ...` 会先触发
+  顶层包初始化并因缺少 `gymnasium` 失败，破坏 `eval/` 的 Isaac-independent 部署承诺。
+
+**验证**
+- `.results/clean_env_fossen_demo/run_clean_smoke.sh` 已通过：系统 Python 缺少
+  `python3.12-venv` 时 fallback 到不含 Isaac 路径的 conda base Python，创建干净 venv，
+  安装 `numpy`、`pyyaml`、CPU-only `torch-2.3.1+cpu`。
+- 验证 venv 中 `omni_spec=None`，依赖来自 `.venv-clean/lib/python3.11/site-packages`。
+- 链路输出：`obs_dim=12`、`action_dim=8`、`backend=torchscript`，
+  `fossen_replay.csv`、`deploy_eval_out.csv`、`chain_summary.json` 均写出。
+
+---
+
 ## 2026-06-07 — 第二期改良（TAG + 分阶段训练）+ 8D 阶段一重训 2500 iter
 
 **新功能（已 py_compile + 功能冒烟通过）**

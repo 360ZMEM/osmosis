@@ -31,7 +31,14 @@ EasyUUV-STDW 的部署评估面向**没有 Isaac Sim 的目标主机**：板载 
 }
 ```
 
-通过 `eval.wrappers.obs_from_state(state) -> np.ndarray (10,)` 转成 obs。
+通过 `eval.wrappers.obs_from_state(state, layout="a3_12d") -> np.ndarray (12,)` 转成当前
+A3 参数化策略观测。旧 demo 策略可显式使用 `layout="legacy_10d"`。
+
+当前 A3 12D 观测布局：
+
+```text
+[goal_quat(4), depth_z(1), root_quat(4), angular_velocity_b(3)]
+```
 
 ## 2. 模型导出
 
@@ -50,7 +57,7 @@ ts.save("ckpt.jit")
 
 ```python
 import torch
-dummy = torch.zeros(1, 10)
+dummy = torch.zeros(1, 12)  # current A3 12D deployment policy
 torch.onnx.export(
     policy.actor, dummy, "ckpt.onnx",
     input_names=["obs"], output_names=["action"],
@@ -70,7 +77,8 @@ torch.save(policy.actor, "ckpt.pt")
 python -m easyuuv_stdw.eval.deploy_eval \
     --policy /abs/path/to/ckpt.jit \
     --replay /abs/path/to/log.csv \
-    --output ./.results/eval_out.csv
+    --output ./.results/eval_out.csv \
+    --obs_layout a3_12d
 ```
 
 **replay CSV 必含列**：
@@ -100,7 +108,7 @@ from easyuuv_stdw.eval import obs_from_state, Policy
 pol = Policy("/path/to/ckpt.jit", device="cpu")
 
 def control_callback(state):
-    obs = obs_from_state(state)            # (10,)
+    obs = obs_from_state(state, layout="a3_12d")  # (12,)
     action = pol.act(obs)                  # (4,) or (8,)
     cmd = thruster_mixer(action[:4])       # 用户自实现
     return cmd
@@ -132,7 +140,7 @@ python easyuuv_stdw/eval/examples/replay_csv_demo.py --policy tests/data/dummy.j
 
 | 症状 | 排查 |
 |---|---|
-| `RuntimeError: shape mismatch` 在 act() | 确认 `obs.shape == (10,)` 且 `dtype=float32` |
+| `RuntimeError: shape mismatch` 在 act() | 当前 A3 策略确认 `obs.shape == (12,)` 且 `dtype=float32`；旧 demo 才是 `legacy_10d` |
 | ONNX session 不能初始化 | `pip install onnxruntime`，检查 opset ≥ 17 |
 | `Policy.act` 返回全零 | ckpt 是否是训练前的 init weight；检查 `policy.eval()` 是否生效 |
 | 4-D vs 8-D 混淆 | 看 `policy_loader.py` print 出的 `action.shape[0]`，必须匹配训练任务 |

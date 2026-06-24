@@ -1,9 +1,8 @@
-"""Deployment-management demo for Scheme-B STDW checkpoints.
+"""Scheme-B STDW checkpoint 的部署管理 demo。
 
-This example is Isaac-independent.  It reads either a STDW run ``summary.json``
-or a per-checkpoint metadata JSON, selects the exported ``*_deploy.jit`` policy,
-builds the current A3 12-D observation, and maps the 8-D policy output to a
-reference thruster command.
+本示例不依赖 Isaac。它读取 STDW 运行的 ``summary.json`` 或单个 checkpoint
+metadata JSON，选出导出的 ``*_deploy.jit`` 策略，构造当前 A3 12D 观测，
+并将 8D 策略输出映射为参考推进器命令。
 """
 
 from __future__ import annotations
@@ -53,14 +52,14 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = load_deploy_config(args.config)
-    # TODO(deploy): On the vehicle, keep model_path in deploy_config.yaml pointed
-    # to the latest exported *_deploy.jit copied from the adaptation run.
+    # TODO(deploy): 实物上应让 deploy_config.yaml 的 model_path 指向
+    # 从自适应运行中拷贝过来的最新 *_deploy.jit。
     policy_arg = args.policy or cfg.policy.model_path
     policy_path = _resolve_policy_path(policy_arg, args.metadata_json, args.summary_json)
     policy = Policy(policy_path, device=cfg.policy.device)
 
-    # TODO(deploy): Replace this dict with the real hardware bridge output.
-    # The keys must match eval/wrappers.py; Isaac is not involved.
+    # TODO(deploy): 将该 dict 替换为真实硬件 bridge 输出。
+    # 字段必须匹配 eval/wrappers.py；这里不涉及 Isaac。
     state = {
         "position": np.array([0.0, 0.0, -1.0], dtype=np.float32),
         "orientation_quat": np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),

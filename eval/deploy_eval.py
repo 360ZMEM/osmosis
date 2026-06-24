@@ -1,14 +1,14 @@
 """@file eval/deploy_eval.py
-@brief CLI deployment-evaluation harness.
+@brief 部署评估 CLI 工具。
 
-Replays a state log through a Policy and writes per-step obs/action/reward
-to CSV for offline analysis. Isaac-independent.
+读取 state log，并逐步通过 Policy 回放，随后将每一步的 obs/action/reward
+写入 CSV，便于离线分析。本工具不依赖 Isaac。
 
-Inputs:
-  --policy <path>   .pt / .jit / .onnx checkpoint loadable by Policy.
-  --replay <path>   CSV with columns required by obs_from_state:
+输入：
+  --policy <path>   可被 Policy 加载的 .pt / .jit / .onnx checkpoint。
+  --replay <path>   CSV，需包含 obs_from_state 所需列：
                        t, px,py,pz, qw,qx,qy,qz, vx,vy,vz, wx,wy,wz, gx,gy,gz, gyaw
-  --output <path>   Output CSV with action_*/reward columns appended.
+  --output <path>   输出 CSV，在原始列后追加 action_*/reward 等列。
 """
 
 from __future__ import annotations

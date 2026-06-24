@@ -47,6 +47,25 @@ DEFAULT_OUT_DIR = REPO_ROOT / "docs" / "figures" / "ppt"
 # Shared-reference (deterministic_reference) full matrix re-run. STDW on/off
 # cells track an identical desired trajectory, so overlays are like-for-like.
 DETREF_MATRIX_DIR = REPO_ROOT / ".results" / "sweep_a3_stage2_detref_20260619_223735"
+OPR_RESCUE_DIR = REPO_ROOT / ".results" / "opr_asym_storm_full_20260619_235828"
+
+# Shrink the matplotlib canvas while preserving each figure's aspect ratio.
+# Text/line sizes are intentionally not scaled down, so the exported figures
+# remain legible when placed in a small PPT slot.
+FIG_SCALE = 0.78
+OVERLAY_FIG_SCALE = 0.70
+
+
+def _figsize(width: float, height: float) -> tuple[float, float]:
+    return (width * FIG_SCALE, height * FIG_SCALE)
+
+
+def _scaled_figsize(width: float, height: float, scale: float) -> tuple[float, float]:
+    return (width * scale, height * scale)
+
+
+def _overlay_figsize(width: float, height: float) -> tuple[float, float]:
+    return _scaled_figsize(width, height, OVERLAY_FIG_SCALE)
 
 # --- shared palette ---------------------------------------------------------
 C_DESIRED = "#222222"
@@ -116,7 +135,7 @@ def plot_tracking_timeline(
     t_lo, t_hi = float(t[0]), float(t[-1])
 
     fig, axes = plt.subplots(
-        6, 1, figsize=(9.6, 5.0), sharex=True,
+        6, 1, figsize=_figsize(9.6, 5.0), sharex=True,
         gridspec_kw={"height_ratios": [1, 1, 1, 1, 0.7, 0.55], "hspace": 0.18},
     )
     fig.subplots_adjust(top=0.88, bottom=0.085, left=0.10, right=0.985)
@@ -205,7 +224,7 @@ def plot_generalization_heatmap(
         for j, wave in enumerate(WAVES):
             values[i, j] = _mean_pairwise(pair_rows, emb, wave)[2]
 
-    fig, ax = plt.subplots(figsize=(11.0, 4.1))
+    fig, ax = plt.subplots(figsize=_figsize(11.0, 4.1))
     im = ax.imshow(values, cmap="RdBu_r", vmin=-150, vmax=150, aspect="auto")
 
     ax.set_xticks(np.arange(len(WAVES)))
@@ -318,7 +337,7 @@ def plot_generalization_heatmap_dual(
             full_vals[i, j] = _full_traj_delta(matrix_dir, emb, wave)
             tail_vals[i, j] = _tail_delta(pair_rows, emb, wave)
 
-    fig, (ax_l, ax_r) = plt.subplots(1, 2, figsize=(13.4, 4.3))
+    fig, (ax_l, ax_r) = plt.subplots(1, 2, figsize=_figsize(13.4, 4.3))
     fig.subplots_adjust(left=0.075, right=0.9, top=0.82, bottom=0.16, wspace=0.28)
     _draw_heat_panel(ax_l, full_vals, "Full-trajectory tracking-MSE change")
     im = _draw_heat_panel(ax_r, tail_vals, "Post-drift tail error change (5s-RMS filtered)")
@@ -332,9 +351,10 @@ def plot_generalization_heatmap_dual(
                  fontsize=11.5, y=0.95)
     fig.text(
         0.49, 0.045,
-        "Negative (blue) = improvement. STDW compresses tracking error on base / long-body / heavy hulls across all spectra "
-        "(full-traj mean -21%, tail mean -42%),\nbut collapses on asymmetric hulls without active routing "
-        "(resolved by OPR, Slide 10). Left = whole-episode raw MSE; right = stationary post-drift filtered error.",
+        "Negative (blue) = improvement. STDW compresses tracking error on base / long-body / heavy hulls "
+        "(full-traj mean -21%, tail mean -42%).\n"
+        "Asymmetric hulls need active routing (resolved by OPR, Slide 10). "
+        "Left = whole-episode raw MSE; right = stationary post-drift filtered error.",
         ha="center", va="top", fontsize=7.6, color="#444444",
     )
     if provenance:
@@ -349,47 +369,49 @@ def plot_generalization_heatmap_dual(
 def plot_opr_recovery(out_dir: Path, stem: str = "fig23_opr_recovery") -> None:
     plunge = (OPR_ASYM_DEFAULT - OPR_ASYM_ROUTED) / OPR_ASYM_DEFAULT * 100.0
 
-    fig, ax = plt.subplots(figsize=(11.0, 3.7))
+    fig, ax = plt.subplots(figsize=(11.0 * 0.56, 3.7 * 0.64))
+    fig.subplots_adjust(left=0.085, right=0.985, top=0.80, bottom=0.26)
     xs = [0.0, 1.0]
     heights = [OPR_ASYM_DEFAULT, OPR_ASYM_ROUTED]
     colors = [C_OFF, C_GREEN]
-    bars = ax.bar(xs, heights, width=0.42, color=colors, zorder=3)
+    bars = ax.bar(xs, heights, width=0.36, color=colors, zorder=3)
 
     ax.set_xticks(xs)
     ax.set_xticklabels(
-        ["Asymmetric, blind STDW-on\n(co-adaptation collapse)",
-         "Asymmetric, STDW-on + OPR\n(offset_correct router)"],
-        fontsize=9,
+        ["Blind STDW-on\nasymmetric hull",
+         "STDW-on + OPR\noffset_correct router"],
+        fontsize=8,
     )
-    ax.set_ylabel("Full-trajectory tracking MSE (m$^2$)", fontsize=9)
-    ax.set_ylim(0, OPR_ASYM_DEFAULT * 1.28)
+    ax.set_ylabel("Tracking MSE (m$^2$)", fontsize=8.5)
+    ax.set_ylim(0, OPR_ASYM_DEFAULT * 1.16)
     _style_axis(ax)
 
     for b, h in zip(bars, heights):
-        ax.text(b.get_x() + b.get_width() / 2, h + 0.005, f"{h:.4f}",
-                ha="center", va="bottom", fontsize=10, fontweight="bold")
+        ax.text(b.get_x() + b.get_width() / 2, h + 0.004, f"{h:.4f}",
+                ha="center", va="bottom", fontsize=9.5, fontweight="bold")
 
-    # base reference dashed line aligned to the routed bar
+    # Base reference label sits in the right margin, away from bars and arrow.
     ax.axhline(OPR_BASE_REF, color=C_GREEN, ls=":", lw=1.4, alpha=0.9, zorder=2)
-    ax.text(-0.05, OPR_BASE_REF + 0.009, f"symmetric base ref = {OPR_BASE_REF:.4f}",
-            va="bottom", ha="left", fontsize=8, color=C_GREEN)
+    ax.text(1.43, OPR_BASE_REF + 0.006, f"symmetric base ref\n{OPR_BASE_REF:.4f}",
+            va="bottom", ha="right", fontsize=7.0, color=C_GREEN,
+            bbox=dict(boxstyle="round,pad=0.18", facecolor="white",
+                      edgecolor="none", alpha=0.82))
 
     # downward plunge arrow from default bar top to routed bar top
     ax.annotate(
-        "", xy=(0.74, OPR_ASYM_ROUTED + 0.012), xytext=(0.26, OPR_ASYM_DEFAULT - 0.004),
-        arrowprops=dict(arrowstyle="-|>", color=C_GREEN, lw=3.0, alpha=0.55),
+        "", xy=(0.78, OPR_ASYM_ROUTED + 0.012), xytext=(0.24, OPR_ASYM_DEFAULT - 0.004),
+        arrowprops=dict(arrowstyle="-|>", color=C_GREEN, lw=2.8, alpha=0.55),
     )
-    # callout placed in the free space above the short routed bar (clear of arrow)
-    ax.text(1.30, OPR_ASYM_DEFAULT * 0.66,
-            f"{plunge:.1f}% Tracking Error\nPlunge via OPR",
-            ha="center", va="center", fontsize=11, fontweight="bold",
+    # Callout placed above/right of the arrow and away from the routed bar label.
+    ax.text(1.18, OPR_ASYM_DEFAULT * 0.93,
+            f"{plunge:.1f}% lower\ntracking MSE",
+            ha="center", va="center", fontsize=10.0, fontweight="bold",
             color=C_GREEN,
-            bbox=dict(boxstyle="round,pad=0.3", facecolor="#e8f5e9",
+            bbox=dict(boxstyle="round,pad=0.25", facecolor="#e8f5e9",
                       edgecolor=C_GREEN, lw=1.2, alpha=0.9))
 
-    ax.set_title("Observable-only OPR rescues asymmetric hulls to nominal level",
-                 fontsize=11, pad=8)
-    ax.set_xlim(-0.55, 2.05)
+    ax.set_title("OPR restores asymmetric-hull tracking", fontsize=10.5, pad=7)
+    ax.set_xlim(-0.35, 1.48)
     _save_ppt(fig, out_dir / stem)
 
 
@@ -404,6 +426,29 @@ def _clean_overlay_axis(ax: plt.Axes) -> None:
     ax.grid(axis="y", color="#cccccc", alpha=0.45, lw=0.6)
     ax.set_axisbelow(True)
     ax.tick_params(labelsize=8, color="#444444")
+
+
+def _inset_label(
+    ax: plt.Axes,
+    text: str,
+    color: str,
+    y: float,
+    *,
+    fontsize: float = 7.6,
+    fontweight: str = "normal",
+) -> None:
+    """Small white-backed label inside the axes to avoid tight-bbox expansion."""
+    ax.text(
+        0.985, y, text,
+        transform=ax.transAxes,
+        ha="right", va="center",
+        fontsize=fontsize,
+        color=color,
+        fontweight=fontweight,
+        bbox=dict(boxstyle="round,pad=0.16", facecolor="white",
+                  edgecolor="none", alpha=0.78),
+        zorder=8,
+    )
 
 
 def _real_trigger_times(data: Dict[str, np.ndarray], t: np.ndarray) -> np.ndarray:
@@ -466,10 +511,10 @@ def plot_publication_overlay(
     C_OURS = "#1f5fbf"    # classic blue ours
 
     fig, axes = plt.subplots(
-        4, 1, figsize=(9.2, 5.4), sharex=True,
+        4, 1, figsize=_overlay_figsize(9.2, 5.4), sharex=True,
         gridspec_kw={"hspace": 0.30},
     )
-    fig.subplots_adjust(top=0.9, bottom=0.1, left=0.085, right=0.83)
+    fig.subplots_adjust(top=0.9, bottom=0.1, left=0.085, right=0.985)
 
     panels = [
         (axes[0], "Roll (rad)", "des_roll", "true_roll"),
@@ -491,21 +536,13 @@ def plot_publication_overlay(
                  "Active Parametric Drift Window", ha="center", va="bottom",
                  fontsize=7.5, color="#4c78a8", style="italic")
 
-    # leader-text annotations in the right margin (no legend box)
-    axes[0].annotate("Desired Reference", xy=(t_hi, on["des_roll"][-1]),
-                     xytext=(t_hi + 0.6, axes[0].get_ylim()[1] * 0.7),
-                     fontsize=8, color=C_REF, va="center",
-                     arrowprops=dict(arrowstyle="-", color=C_REF, lw=0.8))
-    axes[1].annotate(f"Static PPO Baseline\n(MSE = {off_mse:.3f})",
-                     xy=(t_hi, off["true_pitch"][-1]),
-                     xytext=(t_hi + 0.6, axes[1].get_ylim()[0] * 0.9),
-                     fontsize=8, color="#6b7075", va="center", fontweight="bold",
-                     arrowprops=dict(arrowstyle="-", color=C_BASE, lw=0.8))
-    axes[2].annotate(f"Ours (STDW Active\nMSE = {on_mse:.3f})",
-                     xy=(t_hi, on["true_yaw"][-1]),
-                     xytext=(t_hi + 0.6, axes[2].get_ylim()[1] * 0.7),
-                     fontsize=8, color=C_OURS, va="center", fontweight="bold",
-                     arrowprops=dict(arrowstyle="-", color=C_OURS, lw=0.8))
+    # Inset labels stay inside the axes, so bbox_inches="tight" does not expand
+    # the exported canvas at small PPT sizes.
+    _inset_label(axes[0], "Desired Reference", C_REF, 0.78)
+    _inset_label(axes[1], f"Static PPO Baseline\nMSE = {off_mse:.3f}",
+                 "#6b7075", 0.22, fontweight="bold")
+    _inset_label(axes[2], f"Ours (STDW Active)\nMSE = {on_mse:.3f}",
+                 C_OURS, 0.78, fontweight="bold")
 
     # slow-loop triggers on the depth panel baseline only
     ax_d = axes[3]
@@ -513,9 +550,8 @@ def plot_publication_overlay(
     if trig_t.size:
         ax_d.scatter(trig_t, np.full_like(trig_t, y0), marker="v", s=24,
                      color=C_OURS, clip_on=False, zorder=5)
-        ax_d.annotate(f"Adaptation Triggers (n={trig_t.size})",
-                      xy=(t_hi, y0), xytext=(t_hi + 0.6, y0),
-                      fontsize=7.5, color=C_OURS, va="center")
+        _inset_label(ax_d, f"Adaptation Triggers (n={trig_t.size})",
+                     C_OURS, 0.14, fontsize=7.2)
     ax_d.set_xlabel("Time (seconds)", fontsize=9)
 
     fig.suptitle(
@@ -575,10 +611,10 @@ def plot_opr_rescue_overlay(
     C_TRIG = "#d62728"
 
     fig, axes = plt.subplots(
-        5, 1, figsize=(9.4, 6.2), sharex=True,
+        5, 1, figsize=_overlay_figsize(9.4, 6.2), sharex=True,
         gridspec_kw={"height_ratios": [1, 1, 1, 1, 0.7], "hspace": 0.30},
     )
-    fig.subplots_adjust(top=0.88, bottom=0.085, left=0.085, right=0.80)
+    fig.subplots_adjust(top=0.88, bottom=0.085, left=0.085, right=0.985)
 
     panels = [
         (axes[0], "Roll (rad)", "des_roll", "true_roll"),
@@ -600,26 +636,13 @@ def plot_opr_rescue_overlay(
                  "Active Parametric Drift Window", ha="center", va="bottom",
                  fontsize=7.5, color="#4c78a8", style="italic")
 
-    # leader-text annotations in the right margin (no legend box)
-    axes[0].annotate("Desired Reference", xy=(t_hi, opr["des_roll"][-1]),
-                     xytext=(t_hi + 0.6, axes[0].get_ylim()[1] * 0.7),
-                     fontsize=8, color=C_REF, va="center",
-                     arrowprops=dict(arrowstyle="-", color=C_REF, lw=0.8))
-    axes[1].annotate(f"Static PPO Baseline\n(MSE = {off_mse:.3f})",
-                     xy=(t_hi, off["true_pitch"][-1]),
-                     xytext=(t_hi + 0.6, axes[1].get_ylim()[0] * 0.9),
-                     fontsize=8, color="#6b7075", va="center", fontweight="bold",
-                     arrowprops=dict(arrowstyle="-", color=C_BASE, lw=0.8))
-    axes[2].annotate(f"Blind STDW Collapse\n(MSE = {on_mse:.3f})",
-                     xy=(t_hi, on["true_yaw"][-1]),
-                     xytext=(t_hi + 0.6, axes[2].get_ylim()[1] * 0.75),
-                     fontsize=8, color=C_COLLAPSE, va="center", fontweight="bold",
-                     arrowprops=dict(arrowstyle="-", color=C_COLLAPSE, lw=0.8))
-    axes[3].annotate(f"STDW + OPR Rescue\n(MSE = {opr_mse:.3f})",
-                     xy=(t_hi, opr["true_z"][-1]),
-                     xytext=(t_hi + 0.6, axes[3].get_ylim()[1] * 0.7),
-                     fontsize=8, color=C_RESCUE, va="center", fontweight="bold",
-                     arrowprops=dict(arrowstyle="-", color=C_RESCUE, lw=0.8))
+    _inset_label(axes[0], "Desired Reference", C_REF, 0.78)
+    _inset_label(axes[1], f"Static PPO Baseline\nMSE = {off_mse:.3f}",
+                 "#6b7075", 0.22, fontweight="bold")
+    _inset_label(axes[2], f"Blind STDW Collapse\nMSE = {on_mse:.3f}",
+                 C_COLLAPSE, 0.78, fontweight="bold")
+    _inset_label(axes[3], f"STDW + OPR Rescue\nMSE = {opr_mse:.3f}",
+                 C_RESCUE, 0.78, fontweight="bold")
 
     # bottom strip: online-adaptation schedule (rho ramp + slow-loop triggers)
     ax_a = axes[4]
@@ -635,18 +658,13 @@ def plot_opr_rescue_overlay(
         ax_a.scatter(trig_t, np.full_like(trig_t, 1.02), marker="v", s=30,
                      color=C_TRIG, edgecolor="white", linewidth=0.4,
                      clip_on=False, zorder=5)
-        ax_a.annotate(f"slow-loop updates (n={trig_t.size})",
-                      xy=(t_hi, 1.02), xytext=(t_hi + 0.6, 1.02),
-                      fontsize=7.5, color=C_TRIG, va="center")
-    ax_a.annotate(r"$\varrho$ ramp", xy=(t_hi, rho[-1]),
-                  xytext=(t_hi + 0.6, 0.35),
-                  fontsize=7.5, color=C_RESCUE, va="center",
-                  arrowprops=dict(arrowstyle="-", color=C_RESCUE, lw=0.8))
+        _inset_label(ax_a, f"slow-loop updates (n={trig_t.size})",
+                     C_TRIG, 0.85, fontsize=7.0)
+    _inset_label(ax_a, r"$\varrho$ ramp", C_RESCUE, 0.38, fontsize=7.0)
 
     fig.suptitle(
-        f"OPR rescues the {EMB_LABELS[embodiment]} hull from blind-STDW collapse "
-        f"({WAVE_LABELS[wave]} sea state, shared reference)",
-        fontsize=10.5, x=0.085, ha="left", y=0.985,
+        f"OPR rescues {EMB_LABELS[embodiment]} hull ({WAVE_LABELS[wave]}, shared reference)",
+        fontsize=10.0, x=0.085, ha="left", y=0.985,
     )
     _save_ppt(fig, out_dir / stem)
 
@@ -663,6 +681,14 @@ def _latest_misset_csv(cell: str) -> Path:
     cands = sorted(base.rglob("stdw_output.csv"), key=lambda p: p.stat().st_mtime)
     if not cands:
         raise FileNotFoundError(f"no stdw_output.csv under {base}")
+    return cands[-1]
+
+
+def _latest_output_csv(root: Path) -> Path:
+    """Newest canonical stdw_output.csv below an existing result root."""
+    cands = sorted(root.rglob("stdw_output.csv"), key=lambda p: p.stat().st_mtime)
+    if not cands:
+        raise FileNotFoundError(f"no stdw_output.csv under {root}")
     return cands[-1]
 
 
@@ -701,10 +727,10 @@ def plot_misset_online_overlay(
     C_OURS = "#1f5fbf"    # blue: STDW online recovery
 
     fig, axes = plt.subplots(
-        4, 1, figsize=(9.2, 5.4), sharex=True,
+        4, 1, figsize=_overlay_figsize(9.2, 5.4), sharex=True,
         gridspec_kw={"hspace": 0.30},
     )
-    fig.subplots_adjust(top=0.9, bottom=0.1, left=0.085, right=0.82)
+    fig.subplots_adjust(top=0.9, bottom=0.1, left=0.085, right=0.985)
 
     panels = [
         (axes[0], "Roll (rad)", "des_roll", "true_roll"),
@@ -725,38 +751,155 @@ def plot_misset_online_overlay(
                  "Active Parametric Drift Window", ha="center", va="bottom",
                  fontsize=7.5, color="#4c78a8", style="italic")
 
-    axes[0].annotate("Desired Reference", xy=(t_hi, on["des_roll"][-1]),
-                     xytext=(t_hi + 0.6, axes[0].get_ylim()[1] * 0.7),
-                     fontsize=8, color=C_REF, va="center",
-                     arrowprops=dict(arrowstyle="-", color=C_REF, lw=0.8))
-    axes[1].annotate(f"Mis-set Static PPO\n(depth P x0.5, MSE = {off_mse:.3f})",
-                     xy=(t_hi, off["true_pitch"][-1]),
-                     xytext=(t_hi + 0.6, axes[1].get_ylim()[0] * 0.9),
-                     fontsize=8, color=C_BASE, va="center", fontweight="bold",
-                     arrowprops=dict(arrowstyle="-", color=C_BASE, lw=0.8))
-    axes[2].annotate(f"STDW Online Recovery\n(MSE = {on_mse:.3f})",
-                     xy=(t_hi, on["true_yaw"][-1]),
-                     xytext=(t_hi + 0.6, axes[2].get_ylim()[1] * 0.7),
-                     fontsize=8, color=C_OURS, va="center", fontweight="bold",
-                     arrowprops=dict(arrowstyle="-", color=C_OURS, lw=0.8))
+    _inset_label(axes[0], "Desired Reference", C_REF, 0.78)
+    _inset_label(axes[1], f"Mis-set Static PPO\nDepth P x0.5, MSE = {off_mse:.3f}",
+                 C_BASE, 0.22, fontweight="bold")
+    _inset_label(axes[2], f"STDW Online Recovery\nMSE = {on_mse:.3f}",
+                 C_OURS, 0.78, fontweight="bold")
 
     ax_d = axes[3]
     y0 = ax_d.get_ylim()[0]
     if trig_t.size:
         ax_d.scatter(trig_t, np.full_like(trig_t, y0), marker="v", s=24,
                      color=C_OURS, clip_on=False, zorder=5)
-        ax_d.annotate(f"Adaptation Triggers (n={trig_t.size})",
-                      xy=(t_hi, y0), xytext=(t_hi + 0.6, y0),
-                      fontsize=7.5, color=C_OURS, va="center")
+        _inset_label(ax_d, f"Adaptation Triggers (n={trig_t.size})",
+                     C_OURS, 0.14, fontsize=7.2)
     ax_d.set_xlabel("Time (seconds)", fontsize=9)
 
     fig.suptitle(
-        f"STDW recovers a mis-set initial controller online "
-        f"(depth P gain x0.5, {EMB_LABELS[embodiment]} hull, storm sea state)",
-        fontsize=10.5, x=0.085, ha="left", y=0.985,
+        f"STDW online recovery from mis-set depth P x0.5 ({EMB_LABELS[embodiment]})",
+        fontsize=10.0, x=0.085, ha="left", y=0.985,
     )
     out_stem = stem or f"fig28_misset_online_{embodiment}"
     _save_ppt(fig, out_dir / out_stem)
+
+
+# ---------------------------------------------------------------------------
+# Figure 2.8 - compute cost of one STDW effective update (deployment study)
+# ---------------------------------------------------------------------------
+import json as _json  # noqa: E402
+
+COST_JSON = REPO_ROOT / ".results" / "stdw_update_cost" / "stdw_update_cost.json"
+
+
+def plot_update_cost(out_dir: Path, cost_json: Path = COST_JSON,
+                     stem: str = "fig29_stdw_update_cost") -> None:
+    """Two-panel cost card: per-device wall time + invariant cost facts.
+
+    Reads the JSON produced by ``bench_stdw_update_cost.py``. Left panel:
+    grouped bars of one fast-loop inference vs one STDW effective update across
+    devices, with the 16.67 ms control-tick budget drawn as a red ceiling.
+    Right panel: a text "spec sheet" (params / FLOPs / memory / cadence) plus an
+    edge-deployment verdict.
+    """
+    data = _json.loads(Path(cost_json).read_text())
+    benches = data["benchmarks"]
+    labels = [b["label"] for b in benches]
+    infer_ms = [b["inference"]["mean_ms"] for b in benches]
+    update_ms = [b["update"]["mean_ms"] for b in benches]
+    update_p95 = [b["update"]["p95_ms"] for b in benches]
+    budget_ms = data["cadence"]["ctrl_period_ms"]
+
+    fig, (ax, ax_txt) = plt.subplots(
+        1, 2, figsize=_figsize(12.2, 4.3), gridspec_kw={"width_ratios": [1.45, 1.0]}
+    )
+    fig.subplots_adjust(left=0.075, right=0.985, top=0.86, bottom=0.13, wspace=0.05)
+
+    x = np.arange(len(labels))
+    w = 0.36
+    b1 = ax.bar(x - w / 2, infer_ms, w, color=C_OFF, label="Fast-loop inference (1 step)")
+    b2 = ax.bar(x + w / 2, update_ms, w, color=C_ON,
+                yerr=[np.zeros(len(update_ms)), np.array(update_p95) - np.array(update_ms)],
+                capsize=3, ecolor="#33415c",
+                label="STDW effective update (1x)")
+
+    ax.axhline(budget_ms, color=C_TRIG, lw=1.6, ls="--", zorder=4)
+    ax.text(len(labels) - 0.5, budget_ms * 1.04,
+            f"60 Hz control-tick budget = {budget_ms:.1f} ms",
+            ha="right", va="bottom", fontsize=8.5, color=C_TRIG, fontweight="bold")
+
+    for rect, val in zip(b1, infer_ms):
+        ax.text(rect.get_x() + rect.get_width() / 2, val,
+                f"{val*1e3:.0f} us", ha="center", va="bottom", fontsize=7.5,
+                color="#555555")
+    for rect, val in zip(b2, update_ms):
+        ax.text(rect.get_x() + rect.get_width() / 2, val,
+                f"{val:.2f} ms", ha="center", va="bottom", fontsize=8.5,
+                color=C_ON, fontweight="bold")
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, fontsize=8.3)
+    ax.set_ylabel("Wall time per call (ms, log)", fontsize=9.5)
+    ax.set_yscale("log")
+    ax.set_ylim(top=budget_ms * 2.4)
+    ax.legend(frameon=False, loc="upper left", fontsize=8.5,
+              bbox_to_anchor=(0.0, 0.86))
+    _style_axis(ax)
+    ax.set_title("One STDW update stays well inside the real-time budget",
+                 fontsize=10.5, loc="left", pad=6)
+
+    # --- right: spec sheet -------------------------------------------------
+    m = data["model"]
+    f = data["flops"]
+    cad = data["cadence"]
+    gpu_mem = next((b.get("memory", {}) for b in benches
+                    if b["device"] == "cuda"), {})
+    worst_update = max(update_ms)
+    duty = worst_update / 1000.0 * cad["updates_per_second_if_every_interval"] * 100.0
+
+    ax_txt.axis("off")
+    rows = [
+        ("Deployed actor (the controller)", ""),
+        ("  Network", "MLP 12-128-128-8 (ELU)"),
+        ("  Parameters", f"{m['actor_params']:,}"),
+        ("  Inference cost", f"{f['inference_kflops']:.1f} kFLOP / {data['benchmarks'][0]['inference']['mean_ms']*1e3:.0f} us"),
+        ("One STDW effective update", ""),
+        ("  Trainable params (Adam)", f"{m['trainable_params_total']:,}"),
+        ("  Compute", f"~{f['update_mflops_est']:.0f} MFLOP  ({f['update_over_inference_flop_x']:.0f}x one inference)"),
+        ("  Peak GPU memory delta", f"+{gpu_mem.get('delta_update_mib', 0):.1f} MiB" if gpu_mem else "n/a"),
+        ("  Wall time (GPU / CPU-1thr)",
+         f"{benches[0]['update']['mean_ms']:.2f} / "
+         f"{benches[-1]['update']['mean_ms']:.2f} ms"),
+        ("Cadence & duty cycle", ""),
+        ("  Update rate", f"<= {cad['updates_per_second_if_every_interval']:.0f} / s (gated; ~20 / episode)"),
+        ("  Worst-case duty cycle", f"~{duty:.2f}% of compute time"),
+    ]
+    y = 0.97
+    for key, val in rows:
+        is_header = val == ""
+        ax_txt.text(0.0, y, key, fontsize=9.2 if is_header else 8.4,
+                    fontweight="bold" if is_header else "normal",
+                    color="#1a2733" if is_header else "#333333",
+                    va="top", ha="left",
+                    transform=ax_txt.transAxes)
+        if not is_header:
+            ax_txt.text(0.99, y, val, fontsize=8.4, color="#1f5fbf",
+                        va="top", ha="right", transform=ax_txt.transAxes)
+        y -= 0.072
+
+    verdict = (
+        "Edge verdict: even a single CPU thread finishes one update in "
+        f"~{benches[-1]['update']['mean_ms']:.1f} ms, far below the "
+        f"{budget_ms:.1f} ms tick; updates fire <= 1/s, so on-device STDW "
+        "adaptation adds < 0.2% duty cycle. Deployment-friendly."
+    )
+    ax_txt.text(0.0, y - 0.01, verdict, fontsize=8.2, color="#1a9850",
+                va="top", ha="left", style="italic", wrap=True,
+                transform=ax_txt.transAxes,
+                bbox=dict(boxstyle="round,pad=0.4", facecolor="#e8f5e9",
+                          edgecolor=C_GREEN, lw=1.0, alpha=0.9))
+
+    fig.suptitle(
+        "Compute cost of one STDW effective update vs the deployed fast-loop inference",
+        fontsize=11.5, x=0.075, ha="left", y=0.97,
+    )
+    dev = data["meta"].get("cuda_device_name") or "CPU"
+    fig.text(0.075, 0.015,
+             f"Source: bench_stdw_update_cost.py | torch {data['meta']['torch_version']} | "
+             f"{dev} | batch={data['config']['batch_size']}, Adam lr={data['config']['lr']}, "
+             "behavior_kl reg; backward FLOP ~2x forward estimate.",
+             fontsize=6.5, color="#888888", style="italic", ha="left")
+    _save_ppt(fig, out_dir / stem)
 
 
 def main() -> None:
@@ -780,11 +923,21 @@ def main() -> None:
         help="Only (re)generate the mis-set online-recovery side figures "
         "(fig28_*) without touching the validated fig21-24.",
     )
+    parser.add_argument(
+        "--cost_only", action="store_true",
+        help="Only (re)generate the STDW update-cost figure (fig29) without "
+        "touching the other figures.",
+    )
     args = parser.parse_args()
 
     matrix_dir = args.matrix_dir.resolve()
     out_dir = args.out_dir.resolve()
     _ensure_dir(out_dir)
+
+    if args.cost_only:
+        plot_update_cost(out_dir)
+        print(f"[DONE] cost figure written to {out_dir}")
+        return
 
     if args.misset_only:
         for emb in ("base", "heavy_moderate"):
@@ -802,8 +955,8 @@ def main() -> None:
     )
     heatmap_provenance = (
         f"Source: {matrix_dir.name} | policy model_2398 (stage2 2026-06-08), "
-        "deterministic_reference shared-trajectory re-run. Full = whole-episode raw "
-        "tracking-MSE; Tail = post-drift (step>1200) 5s-RMS filtered error "
+        "deterministic_reference shared-trajectory re-run.\n"
+        "Full = whole-episode raw tracking-MSE; Tail = post-drift (step>1200) 5s-RMS filtered error "
         "(final_mse_after_drift), the project-standard adaptation metric."
     )
     plot_generalization_heatmap_dual(
@@ -818,8 +971,30 @@ def main() -> None:
         on_csv=args.overlay_on_csv.resolve() if args.overlay_on_csv else None,
         off_csv=args.overlay_off_csv.resolve() if args.overlay_off_csv else None,
     )
+    plot_publication_overlay(
+        matrix_dir, out_dir,
+        wave="storm",
+        embodiment="heavy_moderate",
+        tune="full",
+        stem="fig25_overlay_storm_heavy_full",
+    )
+    plot_opr_rescue_overlay(
+        off_csv=_find_output_csv(matrix_dir, "storm", "asymmetric", "full", "off"),
+        on_csv=_find_output_csv(matrix_dir, "storm", "asymmetric", "full", "on"),
+        opr_csv=_latest_output_csv(OPR_RESCUE_DIR / "results"),
+        out_dir=out_dir,
+    )
+    plot_publication_overlay(
+        matrix_dir, out_dir,
+        wave="storm",
+        embodiment="heavy_moderate",
+        tune="full",
+        stem="fig27_overlay_heavy_storm_full",
+    )
     for emb in ("base", "heavy_moderate"):
         plot_misset_online_overlay(out_dir, embodiment=emb)
+    if COST_JSON.exists():
+        plot_update_cost(out_dir)
     print(f"[DONE] PPT figures written to {out_dir}")
 
 

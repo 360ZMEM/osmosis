@@ -1,6 +1,5 @@
 """@file eval/examples/replay_csv_demo.py
-@brief Minimal end-to-end demo: load a Policy, build one observation from a
-       hand-crafted state dict, print the action.
+@brief 最小端到端 demo：加载 Policy，从手写 state dict 构造一个观测，并打印动作。
 """
 
 from __future__ import annotations
@@ -24,8 +23,8 @@ def main():
     policy_path = args.policy or cfg.policy.model_path
     obs_layout = args.obs_layout or cfg.policy.obs_layout
 
-    # TODO(deploy): Replace this state with one row from a real replay CSV or
-    # from the live hardware bridge. The keys are the eval/wrappers.py contract.
+    # TODO(deploy): 将这里的 state 替换为真实 replay CSV 的一行，
+    # 或来自在线硬件 bridge 的状态；字段必须符合 eval/wrappers.py 契约。
     state = {
         "position":           np.array([0.0, 0.0, -1.0], dtype=np.float32),
         "orientation_quat":   np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
