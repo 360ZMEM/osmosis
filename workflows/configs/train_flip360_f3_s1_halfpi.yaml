@@ -1,0 +1,30 @@
+train:
+  run_name: flip360_f3_s1_halfpi
+  max_iterations: 120
+
+env:
+  tune_gains: true
+  identity_init: false
+  enable_pe: true
+  enable_deadzone: true
+  enable_param_lpf: true
+  reference_mode: mixed_sine_flip360
+  ref_mix_flip_prob: 0.3
+  ref_sine_amp: [1.5707963, 1.5707963, 0.0]
+  ref_sine_freq: [0.05, 0.05, 0.0]
+  ref_mix_sine_amp: [0.35, 0.35, 0.35]
+  ref_mix_sine_freq: [0.18, 0.22, 0.15]
+  disturbance_cfg:
+    mode: jonswap
+    base_vel: [0.08, 0.0, 0.03]
+    jonswap_hs: 0.8
+    jonswap_fp: 0.14
+    jonswap_gamma: 3.3
+    jonswap_depth: 30.0
+    jonswap_direction: 0.0
+    jonswap_seed: 11
+
+agent:
+  algorithm:
+    learning_rate: 1.0e-4
+    entropy_coef: 0.002

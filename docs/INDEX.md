@@ -31,6 +31,8 @@ docs 按用途分为四个目录：
 | 4 | [`PAPER_STDW_EN.md`](principles/PAPER_STDW_EN.md) | **论文（英文）** — 学术汇报主稿 |
 | 5 | [`PAPER_ADDENDUM_dynamic_identification_20260613.md`](principles/PAPER_ADDENDUM_dynamic_identification_20260613.md) | 论文附录 — 动态参数辨识 |
 | 6 | [`PAPER_ADDENDUM_followup_validation_20260613.md`](principles/PAPER_ADDENDUM_followup_validation_20260613.md) | 论文附录 — router/probe 追加验证 |
+| 7 | [`PAPER_ADDENDUM_lyapunov_esuot_boundary_20260701.md`](principles/PAPER_ADDENDUM_lyapunov_esuot_boundary_20260701.md) | 论文附录 — Lyapunov 重定义 / 方向守卫 / 近边界 / E-SUOT（骨架，可回填） |
+| 8 | [`PAPER_ADDENDUM_multi_embodiment_20260701.md`](principles/PAPER_ADDENDUM_multi_embodiment_20260701.md) | 论文附录 — 多机型泛化 / 配置化推力分配 TAM / 下沉后 flip360 近边界协议 / REMUS 差距分析（骨架，可回填） |
 
 ## 工程实践 · engineering/
 
@@ -58,6 +60,8 @@ docs 按用途分为四个目录：
 | 5 | [`CLEAN_ENV_STDW_FOSSEN_DEMO.md`](guide/CLEAN_ENV_STDW_FOSSEN_DEMO.md) | 干净 Python 环境 + Fossen 6-DOF 虚拟实物的最小部署链路教程 |
 | 6 | [`ERROR_CASES.md`](guide/ERROR_CASES.md) | 常见调试坑（yaml 注入失效、CUDA / dim mismatch 等） |
 | 7 | [`AGENT_HANDOFF.md`](guide/AGENT_HANDOFF.md) | **AI 续接指令** — 新 agent 接手时的最短重启包 |
+| 8 | [`EMBODIMENT_ZOO.md`](guide/EMBODIMENT_ZOO.md) | **多机型使用手册** — uuv6/uuv4/角度变种/REMUS + 下沉后 flip360 + ckpt 适用矩阵 + M1–M6 默认状态 |
+| 9 | [`EMBODIMENT_ZOO_RUNBOOK.md`](guide/EMBODIMENT_ZOO_RUNBOOK.md) | **多机型工程 Runbook** — smoke test / 训练命令 / 验收标准 / 失败处理 |
 
 ---
 

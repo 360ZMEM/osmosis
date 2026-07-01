@@ -75,6 +75,26 @@ def _compute_tracking_mse(csv_df) -> dict:
     }
 
 
+def _shade_bool_spans(ax, steps, mask_bool, color: str, alpha: float, label: str | None = None) -> None:
+    """Shade contiguous ``mask_bool==True`` spans on ``ax`` (label only first span)."""
+    steps = np.asarray(steps, dtype=float)
+    mask_bool = np.asarray(mask_bool, dtype=bool)
+    if steps.size == 0 or mask_bool.size == 0:
+        return
+    in_span = False
+    span_start = None
+    labelled = False
+    for i, active in enumerate(mask_bool):
+        if active and not in_span:
+            in_span, span_start = True, steps[i]
+        elif not active and in_span:
+            ax.axvspan(span_start, steps[i], color=color, alpha=alpha, label=None if labelled else label)
+            labelled = True
+            in_span = False
+    if in_span:
+        ax.axvspan(span_start, steps[-1], color=color, alpha=alpha, label=None if labelled else label)
+
+
 def _add_event_markers(ax, volume_jump_step: int, flow_jump_step: int, best_save_step: int | None = None) -> None:
     if volume_jump_step is not None:
         ax.axvline(volume_jump_step, color="#444444", linestyle=":", linewidth=1.0, alpha=0.8, label="Volume jump")
@@ -310,6 +330,157 @@ def _plot_tracking_overlay(csv_df, output_plot: Path, mse_data: dict, volume_jum
     plt.close(fig)
 
 
+def _plot_lyapunov_guard(csv_df, output_plot: Path, volume_jump_step: int, flow_jump_step: int, best_save_step: int | None) -> bool:
+    """Lyapunov sieve + STDW direction-guard diagnostics.
+
+    Three stacked panels (each drawn only when its columns exist):
+
+    * V_t / dV timeline with Lyapunov-fail spans shaded.
+    * Lyapunov windowed pass-rate + safety-block spans.
+    * STDW direction-guard pass-rate / signed alignment with update-reject spans.
+
+    Returns ``False`` (and writes nothing) when none of the source columns are
+    present so callers can drop the path from the returned dict.
+    """
+    has_V = "lyapunov_V" in csv_df.columns
+    has_pass_rate = "lyapunov_pass_rate_window" in csv_df.columns
+    has_guard = "stdw_dir_guard_pass_rate" in csv_df.columns or "stdw_dir_guard_align" in csv_df.columns
+    if not (has_V or has_pass_rate or has_guard):
+        return False
+
+    steps = np.asarray(csv_df["step"], dtype=float)
+    fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
+
+    # Panel 0: V_t and dV, shade Lyapunov-fail steps.
+    ax_v = axes[0]
+    if has_V:
+        ax_v.plot(steps, np.asarray(csv_df["lyapunov_V"], dtype=float), color="#1f77b4", linewidth=1.3, label="V_t")
+    if "lyapunov_dV" in csv_df.columns:
+        ax_dv = ax_v.twinx()
+        ax_dv.plot(steps, np.asarray(csv_df["lyapunov_dV"], dtype=float), color="#ff7f0e", linewidth=1.0, alpha=0.8, label="dV")
+        ax_dv.axhline(0.0, color="#ff7f0e", linestyle=":", linewidth=0.8, alpha=0.6)
+        ax_dv.set_ylabel("dV", color="#ff7f0e")
+    if "lyapunov_pass" in csv_df.columns:
+        fail = np.asarray(csv_df["lyapunov_pass"], dtype=float) < 0.5
+        _shade_bool_spans(ax_v, steps, fail, color="#d62728", alpha=0.12, label="Lyapunov fail")
+    _add_event_markers(ax_v, volume_jump_step, flow_jump_step, best_save_step)
+    ax_v.set_ylabel("V_t", color="#1f77b4")
+    ax_v.grid(True, alpha=0.3)
+    ax_v.legend(loc="upper left", fontsize=8)
+
+    # Panel 1: windowed pass-rate and safety-block spans.
+    ax_pr = axes[1]
+    if has_pass_rate:
+        ax_pr.plot(steps, np.asarray(csv_df["lyapunov_pass_rate_window"], dtype=float), color="#2ca02c", linewidth=1.2, label="Pass-rate (window)")
+        ax_pr.set_ylim(-0.05, 1.05)
+    if "lyapunov_safety_block" in csv_df.columns:
+        blocked = np.asarray(csv_df["lyapunov_safety_block"], dtype=float) > 0.5
+        _shade_bool_spans(ax_pr, steps, blocked, color="#8c564b", alpha=0.18, label="Safety block")
+    _add_event_markers(ax_pr, volume_jump_step, flow_jump_step, best_save_step)
+    ax_pr.set_ylabel("Lyapunov pass-rate")
+    ax_pr.grid(True, alpha=0.3)
+    ax_pr.legend(loc="best", fontsize=8)
+
+    # Panel 2: direction-guard pass-rate / signed alignment, shade rejected updates.
+    ax_g = axes[2]
+    if "stdw_dir_guard_pass_rate" in csv_df.columns:
+        ax_g.plot(steps, np.asarray(csv_df["stdw_dir_guard_pass_rate"], dtype=float), color="#9467bd", linewidth=1.2, label="Dir-guard pass-rate")
+    if "stdw_dir_guard_align" in csv_df.columns:
+        ax_g.plot(steps, np.asarray(csv_df["stdw_dir_guard_align"], dtype=float), color="#17becf", linewidth=1.2, label="Dir-guard align (signed)")
+    ax_g.axhline(0.0, color="#444444", linestyle=":", linewidth=0.8, alpha=0.6)
+    if "stdw_update_rejected" in csv_df.columns:
+        rejected = np.asarray(csv_df["stdw_update_rejected"], dtype=float) > 0.5
+        _shade_bool_spans(ax_g, steps, rejected, color="#d62728", alpha=0.15, label="Update rejected")
+    _add_event_markers(ax_g, volume_jump_step, flow_jump_step, best_save_step)
+    ax_g.set_ylabel("Direction guard")
+    ax_g.set_xlabel("Simulation Step")
+    ax_g.grid(True, alpha=0.3)
+    ax_g.legend(loc="best", fontsize=8)
+
+    fig.suptitle("STDW Lyapunov Sieve & Direction Guard")
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    fig.savefig(output_plot, dpi=180)
+    plt.close(fig)
+    return True
+
+
+def _plot_boundary_wrench(csv_df, output_plot: Path, volume_jump_step: int, flow_jump_step: int, best_save_step: int | None) -> bool:
+    """M4 near-boundary diagnostics: submersion ratio, boundary forces, ventilation.
+
+    Panels (each drawn only when its columns exist):
+
+    * Free-surface submersion ratio s(t) ∈ [0, 1].
+    * Additive boundary force magnitudes (residual buoyancy ΔB, ground-effect |F|).
+    * Per-step minimum thruster ventilation factor ∈ [0, 1].
+
+    Returns ``False`` (writes nothing) when none of the columns are present so
+    callers can drop the path from the returned dict (graceful degrade when M4
+    is off / columns absent).
+    """
+    has_sub = "boundary_submersion_ratio" in csv_df.columns
+    has_force = "boundary_residual_dB" in csv_df.columns or "boundary_ground_mag" in csv_df.columns
+    has_vent = "boundary_vent_min" in csv_df.columns
+    if not (has_sub or has_force or has_vent):
+        return False
+
+    steps = np.asarray(csv_df["step"], dtype=float)
+
+    def _finite(col: str) -> np.ndarray | None:
+        arr = np.asarray(csv_df[col], dtype=float)
+        return arr if np.any(np.isfinite(arr)) else None
+
+    panels: list[str] = []
+    if has_sub:
+        panels.append("sub")
+    if has_force:
+        panels.append("force")
+    if has_vent:
+        panels.append("vent")
+    fig, axes = plt.subplots(len(panels), 1, figsize=(12, 3.2 * len(panels)), sharex=True, squeeze=False)
+    axes = axes[:, 0]
+
+    drew_any = False
+    for ax, kind in zip(axes, panels):
+        if kind == "sub":
+            arr = _finite("boundary_submersion_ratio")
+            if arr is not None:
+                ax.plot(steps, arr, color="#1f77b4", linewidth=1.3, label="Submersion ratio s(t)")
+                ax.set_ylim(-0.05, 1.05)
+                drew_any = True
+            ax.set_ylabel("s(t)")
+        elif kind == "force":
+            r = _finite("boundary_residual_dB") if "boundary_residual_dB" in csv_df.columns else None
+            g = _finite("boundary_ground_mag") if "boundary_ground_mag" in csv_df.columns else None
+            if r is not None:
+                ax.plot(steps, r, color="#2ca02c", linewidth=1.2, label="Residual buoyancy ΔB")
+                drew_any = True
+            if g is not None:
+                ax.plot(steps, g, color="#d62728", linewidth=1.2, label="Ground-effect |F|")
+                drew_any = True
+            ax.set_ylabel("Boundary force (N)")
+        elif kind == "vent":
+            arr = _finite("boundary_vent_min")
+            if arr is not None:
+                ax.plot(steps, arr, color="#9467bd", linewidth=1.3, label="Min ventilation factor")
+                ax.set_ylim(-0.05, 1.05)
+                drew_any = True
+            ax.set_ylabel("Ventilation")
+        _add_event_markers(ax, volume_jump_step, flow_jump_step, best_save_step)
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="best", fontsize=8)
+    axes[-1].set_xlabel("Simulation Step")
+
+    if not drew_any:
+        plt.close(fig)
+        return False
+
+    fig.suptitle("STDW M4 Near-Boundary Effects")
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    fig.savefig(output_plot, dpi=180)
+    plt.close(fig)
+    return True
+
+
 def _plot_stdw_diagnostics(csv_df, output_dir: Path, volume_jump_step: int, flow_jump_step: int, best_save_step: int | None):
     output_dir = Path(output_dir)
     mse_data = _compute_tracking_mse(csv_df)
@@ -329,6 +500,12 @@ def _plot_stdw_diagnostics(csv_df, output_dir: Path, volume_jump_step: int, flow
     _plot_losses(csv_df, plot_paths["losses"], volume_jump_step, flow_jump_step, best_save_step)
     _plot_actions(csv_df, plot_paths["actions"], volume_jump_step, flow_jump_step, best_save_step)
     _plot_domain(csv_df, plot_paths["domain_shift"], volume_jump_step, flow_jump_step, best_save_step)
+    lyapunov_guard_path = output_dir / "stdw_lyapunov_V.png"
+    if _plot_lyapunov_guard(csv_df, lyapunov_guard_path, volume_jump_step, flow_jump_step, best_save_step):
+        plot_paths["lyapunov_guard"] = lyapunov_guard_path
+    boundary_path = output_dir / "stdw_boundary_wrench.png"
+    if _plot_boundary_wrench(csv_df, boundary_path, volume_jump_step, flow_jump_step, best_save_step):
+        plot_paths["boundary_wrench"] = boundary_path
     mse_summary = {key: value for key, value in mse_data.items() if isinstance(value, float)}
     return plot_paths, mse_summary
 
@@ -342,4 +519,6 @@ plot_tracking_overlay = _plot_tracking_overlay
 plot_losses = _plot_losses
 plot_actions = _plot_actions
 plot_domain = _plot_domain
+plot_lyapunov_guard = _plot_lyapunov_guard
+plot_boundary_wrench = _plot_boundary_wrench
 plot_stdw_diagnostics = _plot_stdw_diagnostics

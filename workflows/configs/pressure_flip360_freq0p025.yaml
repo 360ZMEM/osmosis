@@ -1,0 +1,18 @@
+env:
+  tune_gains: true
+  identity_init: false
+  enable_pe: true
+  enable_deadzone: true
+  enable_param_lpf: true
+  reference_mode: flip360_sine
+  ref_sine_amp: [3.1415926, 3.1415926, 0.0]
+  ref_sine_freq: [0.025, 0.025, 0.0]
+  disturbance_cfg:
+    mode: jonswap
+    base_vel: [0.08, 0.0, 0.03]
+    jonswap_hs: 0.8
+    jonswap_fp: 0.14
+    jonswap_gamma: 3.3
+    jonswap_depth: 30.0
+    jonswap_direction: 0.0
+    jonswap_seed: 11

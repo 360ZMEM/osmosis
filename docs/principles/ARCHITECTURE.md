@@ -22,7 +22,17 @@ EasyUUV-STDW
 ├── easyuuv_stdw_wrapper.py ── gym.Wrapper (慢时域)
 │   ├── COB drift 推进
 │   ├── 5s 滑窗 RMS
-│   └── Lyapunov mask
+│   └── Lyapunov mask (V 可选 pose_quadratic/so3_consistent/energy_with_rate/control_lyapunov)
+│
+├── stdw_dir_guard.py      ── M2 方向性硬约束 (DirGuardConfig + evaluate)
+│                             建立在 Lyapunov dV-mask 之上，拒绝而非降权慢环更新
+├── boundary_effects.py    ── M4 近边界 wrench (BoundaryEffectModels.compute_boundary_wrench)
+│                             residual_buoyancy/free_surface/ground_effect/nonlinear_restoring
+├── esuot/                 ── M5 无先验域适应 (E-SUOT，替 OPR，纯 torch，不依赖 Isaac)
+│   ├── semidual.py        ── 熵正则半对偶目标 + dual potential w_φ
+│   ├── transport.py       ── 传输映射 T_θ + Algorithm 1 交替训练
+│   ├── light.py           ── 轻量 Sinkhorn/barycentric 后端（无 NN）
+│   └── adapter.py         ── DomainAdaptAdapter：产出慢环 target 锚，替 pseudo_actions
 │
 ├── gain_tuner.py          ── ParametricGainTuner（开环 4 阶段）
 ├── wave_disturbance_manager.py  ── JONSWAP 谱波生成
@@ -35,14 +45,16 @@ EasyUUV-STDW
 │   └── rsl_rl_ppo_cfg.py  ── 两个 PPORunnerCfg（baseline 4-D / parametric 8-D）
 │
 ├── stdw_integration/      ── STDW 与 PPO 内核的桥接（slow-loop 触发器、buffer）
+│   └── plots.py           ── per-run 诊断图（+ plot_lyapunov_guard / plot_boundary_wrench）
 │
 ├── workflows/             ── Isaac-Lab-依赖的训练/评估脚本
 │   ├── train_meta.py
-│   ├── play_stdw_adapt.py
+│   ├── play_stdw_adapt.py ── 慢环 eval + M1/M2/M4/M5 CLI 开关入口
 │   ├── play_meta_eval.py
 │   ├── sweep_full_matrix.py / sweep_72cell.py / sweep_stdw.py
+│   ├── sweep_stdw_safety_pressure.py  ── M6 case-based 聚焦安全压测矩阵
 │   ├── configs/<wave_*.yaml>
-│   └── tools/aggregate_*.py
+│   └── tools/aggregate_*.py / plot_safety_pressure_matrix.py
 │
 ├── eval/                  ── Isaac-independent (numpy + torch / onnxruntime)
 │   ├── wrappers.py        ── obs_from_state / reward_from_state
@@ -89,17 +101,31 @@ ENV_RESET ──▶ obs (10D) ──▶ Actor MLP ──▶ μ (4D or 8D)
 EasyUUVEnv ──gym.Wrapper──▶ EasyUUVStdwWrapper ──▶ Policy.act()
    │            ├ COB drift 推进
    │            ├ 5s RMS
-   │            └ Lyapunov mask
+   │            └ Lyapunov mask (M1: V_mode)
    │
    每 60 step ──▶ slow_loop_trigger ──▶ stdw_integration ──▶ policy 微调
-                                                              ├─ MSE on masked window
-                                                              └─ L2 anchor / behavior_kl
+   │                                       ├─ MSE on masked window
+   │                                       ├─ M2 dir_guard.evaluate → accept/reject 整批更新
+   │                                       ├─ target 锚: OPR pseudo_actions  ── 或 ──
+   │                                       │             M5 esuot.DomainAdaptAdapter（无先验）
+   │                                       └─ L2 anchor / behavior_kl
    │
    END ──▶ summary.json (final_mse, drift, slow_loop_triggers, ...)
-       └─▶ tracking_mse.csv
+       └─▶ tracking_mse.csv + STDW 诊断列（lyapunov_*, stdw_dir_guard_*, boundary_*）
 ```
 
-### 2.3 部署评估（Isaac-independent）
+### 2.3 近边界效应注入（M4，可选，改动力学）
+
+```
+play_stdw_adapt ──▶ env.apply_boundary_effect(spec)   # ctrl_mismatch 之后、首次 reset 之前
+                          │
+_compute_dynamics ──▶ BoundaryEffectModels.compute_boundary_wrench(pose, vel)
+                          │  返回 (wrench, info={submersion_ratio, residual_dB, ground_mag})
+                          ├─▶ forces/torques += wrench   # 加性合入 body-frame
+                          └─▶ env._last_boundary_info = info   # 供 CSV 只读落盘（off 时 NaN）
+```
+
+### 2.4 部署评估（Isaac-independent）
 
 ```
 real-vehicle telemetry / CSV ──▶ obs_from_state(state)  (10D)
@@ -126,6 +152,9 @@ real-vehicle telemetry / CSV ──▶ obs_from_state(state)  (10D)
 | `play_stdw_adapt.py` ↔ `easyuuv_env.py` | `apply_runtime_domain_shift` 不覆盖 jonswap_* | yaml 注入失效（[`ERROR_CASES.md`](../guide/ERROR_CASES.md) §1） |
 | `__init__.py` ↔ `agents/rsl_rl_ppo_cfg.py` | `experiment_name` 与 `num_actions` 必须一致 | actor MLP 维度不匹配 |
 | `eval/wrappers.py` ↔ `easyuuv_env.py` | obs 列顺序与训练时一致 | 推理输出乱码 |
+| `play_stdw_adapt.py` ↔ `stdw_dir_guard.py` | M2 guard 消费 M1 的 dV-mask（依赖 V_mode 已算好） | guard 拒绝逻辑失据 |
+| `boundary_effects.py` ↔ `easyuuv_env.py` | `_last_boundary_info` 键名（submersion_ratio/residual_dB/ground_mag）与 CSV/plot 列一致 | 诊断列恒 NaN 或绘图跳过 |
+| `esuot/adapter.py` ↔ `play_stdw_adapt.py` | esuot_* 与 OPR 单选互斥（domain_adapt_backend） | 双路径同时写 target 锚打架 |
 
 ---
 

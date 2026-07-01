@@ -17,23 +17,27 @@ Slow-Time Domain Wrapper (STDW) 慢环自适应控制 + JONSWAP 海况扰动 + 8
 ## 命令契约（5 条，详见 [`docs/guide/COMMAND_CONTRACT.md`](docs/guide/COMMAND_CONTRACT.md)）
 
 ```bash
-# C1. 训练（8D parametric，A3 stage2 baseline）
-python workflows/train_meta.py --task EasyUUV-Direct-Parametric-v1 \
-    --num_envs 512 --max_iterations 2400
+# C1. 训练（8D parametric，A3 stage2 baseline；两阶段完整命令见 COMMAND_CONTRACT）
+bash custom_workflows/run_with_isaac_env.sh workflows/train_meta.py \
+    --task EasyUUV-Direct-Parametric-v1 --num_envs 512 \
+    --max_iterations 1200 --meta_stage 1 --headless --logger tensorboard
 
 # C3. 慢环评估（STDW on）
-python workflows/play_stdw_adapt.py --task EasyUUV-Direct-Parametric-v1 \
+bash custom_workflows/run_with_isaac_env.sh workflows/play_stdw_adapt.py \
+    --task EasyUUV-Direct-Parametric-v1 \
     --experiment_name easyuuv_parametric --num_envs 1 --headless \
     --workflow_config workflows/configs/wave_storm.yaml --wave_mode jonswap \
     --use_stdw True --target_drift 0.05 \
-    --checkpoint /abs/path/to/model_2398.pt
+    --load_run 2026-06-08_13-48-14_stage2 --checkpoint model_2398.pt
 
 # C4. 全矩阵评估（48 cell ≈ 23 min）
-python workflows/sweep_full_matrix.py --policy_path /abs/path/to/model_2398.pt \
-    --out_root .results/full_matrix_$(date +%Y%m%d)
+bash custom_workflows/run_with_isaac_env.sh workflows/sweep_full_matrix.py \
+    --policy_path logs/rsl_rl/easyuuv_parametric/2026-06-08_13-48-14_stage2/model_2398.pt \
+    --out_root .results/sweep_a3_stage2_$(date +%Y%m%d_%H%M%S) --seeds 0
 
 # C5. 聚合
-python workflows/tools/aggregate_full_matrix.py --matrix_dir .results/full_matrix_<date>
+bash custom_workflows/run_with_isaac_env.sh workflows/tools/aggregate_full_matrix.py \
+    --matrix_dir .results/sweep_a3_stage2_<timestamp>
 
 # Eval（不依赖 Isaac）
 python -m easyuuv_stdw.eval.deploy_eval --policy ckpt.jit --replay log.csv \

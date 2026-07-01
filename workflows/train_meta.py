@@ -127,8 +127,8 @@ parser.add_argument("--identity_init", type=_bool_arg, default=None,
                     help="幂等初始化（旁路全部 4 个机制，ζ_runtime ≡ ζ_nominal），用于课程式起步")
 
 # === 分阶段元控制训练 (Stage-wise Meta-Control Training) ===
-parser.add_argument("--meta_stage", type=int, default=1, choices=[1, 2],
-                    help="分阶段训练：1=动作稳定化(只训控制头,增益头冻结为0)；2=增益自整定(冻结控制头,只训增益头)")
+parser.add_argument("--meta_stage", type=int, default=1, choices=[0, 1, 2],
+                    help="分阶段训练：0=不隔离梯度的 fine-tune；1=动作稳定化(只训控制头,增益头冻结为0)；2=增益自整定(冻结控制头,只训增益头)")
 parser.add_argument("--stage1_checkpoint", type=str, default=None,
                     help="阶段二加载的阶段一最优权重 .pt 路径")
 parser.add_argument("--stage2_cob_offset_xyz", type=str, default="0.03,0.03,0.01",
@@ -136,21 +136,36 @@ parser.add_argument("--stage2_cob_offset_xyz", type=str, default="0.03,0.03,0.01
 parser.add_argument("--stage2_wave_mode", type=str, default="jonswap",
                     choices=["none", "constant", "sine", "jonswap"],
                     help="阶段二海浪扰动模式")
+parser.add_argument("--resume_load_optimizer", type=_bool_arg, default=True,
+                    help="resume 时是否加载 optimizer state；fine-tune/跨 stage 迁移时可设 False 只加载 policy/normalizer")
 
 # === 参考轨迹 + 阻尼奖励（曲线平滑/抑超调调优） ===
 parser.add_argument("--reference_mode", type=str, default=None,
-                    choices=["step", "sine_sweep"],
-                    help="参考轨迹模式：step=随机姿态硬阶跃；sine_sweep=平滑正弦扫频")
+                    choices=["step", "sine_sweep", "flip360_sine", "mixed_sine_flip360"],
+                    help="参考轨迹模式：step=随机姿态硬阶跃；sine_sweep=平滑正弦扫频；flip360_sine=roll/pitch ±π 连续后空翻；mixed_sine_flip360=普通正弦+后空翻混合 replay")
 parser.add_argument("--ref_sine_amp", type=str, default=None,
                     help="sine_sweep 逐轴幅度 (rad)，逗号分隔 roll,pitch,yaw（课程式低幅起步）")
 parser.add_argument("--ref_sine_freq", type=str, default=None,
                     help="sine_sweep 逐轴频率 (Hz)，逗号分隔 roll,pitch,yaw")
+parser.add_argument("--ref_mix_flip_prob", type=float, default=None,
+                    help="mixed_sine_flip360 中抽到 flip360 子任务的 env 比例")
+parser.add_argument("--ref_mix_sine_amp", type=str, default=None,
+                    help="mixed_sine_flip360 中 ordinary sine 子任务幅度，逗号分隔 roll,pitch,yaw")
+parser.add_argument("--ref_mix_sine_freq", type=str, default=None,
+                    help="mixed_sine_flip360 中 ordinary sine 子任务频率，逗号分隔 roll,pitch,yaw")
 parser.add_argument("--rew_scale_ang_vel", type=float, default=None,
                     help="角速度阻尼奖励权重（抑制振荡），默认 cfg 值")
 parser.add_argument("--rew_scale_action_rate", type=float, default=None,
                     help="动作平滑（一阶差）阻尼权重，默认 cfg 值")
 parser.add_argument("--rew_scale_action_jerk", type=float, default=None,
                     help="动作 jerk（二阶差）阻尼权重，压制高频震荡，默认 cfg 值")
+parser.add_argument(
+    "--embodiment",
+    type=str,
+    default="base",
+    choices=["base", "long_body", "heavy_moderate", "asymmetric", "uuv6", "uuv4", "uuv6_angled", "uuv4_angled"],
+    help="训练时切换 embodiment；base 保持默认旧路径，其余在 gym.make 后调用 env.apply_embodiment_config。",
+)
 
 # 与 custom_workflows/cli_args.py 的 RSL-RL CLI 兼容
 import cli_args  # noqa: E402  isort: skip
@@ -213,6 +228,7 @@ META_CFG_KEYS = (
     "param_lpf_cutoff",
     "identity_init",
     "reference_mode",
+    "ref_mix_flip_prob",
     "rew_scale_ang_vel",
     "rew_scale_action_rate",
     "rew_scale_action_jerk",
@@ -231,7 +247,7 @@ def _apply_meta_cfg_overrides(env_cfg, args) -> None:
         print(f"[INFO] Override env_cfg.{key} = {value}")
 
     # 列表型参考参数单独解析（逗号分隔 -> list[float]）。
-    for key in ("ref_sine_amp", "ref_sine_freq"):
+    for key in ("ref_sine_amp", "ref_sine_freq", "ref_mix_sine_amp", "ref_mix_sine_freq"):
         raw = getattr(args, key, None)
         if raw is None:
             continue
@@ -246,6 +262,9 @@ def _apply_meta_cfg_overrides(env_cfg, args) -> None:
 
 def _apply_stage_env_overrides(env_cfg, args) -> None:
     """阶段相关 env_cfg 覆盖（在通用 meta override 之后调用，优先级最高）。"""
+    if args.meta_stage == 0:
+        print("[INFO][Stage0] fine-tune mode: keep env_cfg overrides unchanged")
+        return
     if args.meta_stage == 1:
         # 阶段一：底层完全使用标称参数（ζ_runtime ≡ ζ_nominal），增益头不影响动力学。
         if hasattr(env_cfg, "identity_init"):
@@ -273,6 +292,10 @@ def _apply_stage_env_overrides(env_cfg, args) -> None:
 def _setup_stage_gradient_isolation(runner, args) -> None:
     """按行隔离 actor 输出层梯度：阶段一冻结增益头(后4行)，阶段二严格锁定控制头(前4行)+主干。"""
     import torch as _torch
+
+    if args.meta_stage == 0:
+        print("[INFO][Stage0] fine-tune mode: no gradient isolation")
+        return
 
     actor = runner.alg.actor_critic.actor
     linears = [m for m in actor.modules() if isinstance(m, _torch.nn.Linear)]
@@ -405,6 +428,8 @@ def main():
         args_cli.seed = train_cfg["seed"]
     if args_cli.max_iterations is None and "max_iterations" in train_cfg:
         args_cli.max_iterations = train_cfg["max_iterations"]
+    if args_cli.embodiment == parser.get_default("embodiment") and "embodiment" in train_cfg:
+        args_cli.embodiment = train_cfg["embodiment"]
 
     paths = WorkflowPaths.from_overrides(
         logs_root=args_cli.logs_root or path_cfg.get("logs_root"),
@@ -455,6 +480,12 @@ def main():
         cfg=env_cfg,
         render_mode="rgb_array" if args_cli.video else None,
     )
+    if args_cli.embodiment != "base":
+        try:
+            env.unwrapped.apply_embodiment_config(args_cli.embodiment)
+            print(f"[INFO] applied embodiment: {args_cli.embodiment}")
+        except Exception as exc:
+            raise RuntimeError(f"apply_embodiment_config({args_cli.embodiment!r}) failed") from exc
     if args_cli.video:
         video_kwargs = {
             "video_folder": os.path.join(log_dir, "videos"),
@@ -479,8 +510,8 @@ def main():
             checkpoint_name=agent_cfg.load_checkpoint,
             fallback_resolver=get_checkpoint_path,
         )
-        print(f"[INFO]: Loading model checkpoint from: {resume_path}")
-        runner.load(resume_path)
+        print(f"[INFO]: Loading model checkpoint from: {resume_path} (load_optimizer={args_cli.resume_load_optimizer})")
+        runner.load(resume_path, load_optimizer=bool(args_cli.resume_load_optimizer))
 
     # 阶段二：显式加载阶段一最优权重（独立于 RL resume 续训路径）。
     if args_cli.meta_stage == 2:

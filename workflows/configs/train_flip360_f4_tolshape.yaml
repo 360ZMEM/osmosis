@@ -1,0 +1,35 @@
+train:
+  run_name: flip360_f4_tolshape
+  max_iterations: 150
+
+env:
+  tune_gains: true
+  identity_init: false
+  enable_pe: true
+  enable_deadzone: true
+  enable_param_lpf: true
+  reference_mode: mixed_sine_flip360
+  ref_mix_flip_prob: 0.5
+  ref_sine_amp: [3.1415926, 3.1415926, 0.0]
+  ref_sine_freq: [0.05, 0.05, 0.0]
+  ref_mix_sine_amp: [0.35, 0.35, 0.35]
+  ref_mix_sine_freq: [0.18, 0.22, 0.15]
+  # F4：难区间容差整形（不放慢参考）。在 goal 倾角 [120deg,180deg] 内按 smoothstep
+  # 把姿态项高斯宽度最多放宽 3x，降低对物理不可达/不稳定倒置目标的持续扣分。
+  flip_tol_relax: 2.0
+  flip_tol_band_lo: 2.094395
+  flip_tol_band_hi: 3.1415926
+  disturbance_cfg:
+    mode: jonswap
+    base_vel: [0.08, 0.0, 0.03]
+    jonswap_hs: 0.8
+    jonswap_fp: 0.14
+    jonswap_gamma: 3.3
+    jonswap_depth: 30.0
+    jonswap_direction: 0.0
+    jonswap_seed: 11
+
+agent:
+  algorithm:
+    learning_rate: 8.0e-5
+    entropy_coef: 0.002

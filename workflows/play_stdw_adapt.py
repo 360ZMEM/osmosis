@@ -590,6 +590,59 @@ parser.add_argument(
 parser.add_argument("--enable_lyapunov_mask", type=_bool_arg, default=True)
 parser.add_argument("--lyapunov_eps", type=float, default=0.0)
 parser.add_argument("--lyapunov_p_diag", type=str, default="1.0,1.0,1.0,1.0")
+parser.add_argument(
+    "--lyapunov_gate_mode",
+    type=str,
+    default="sample_mask",
+    choices=["sample_mask", "strict_sample_mask", "guarded_drift"],
+)
+parser.add_argument("--lyapunov_abs_margin", type=float, default=0.0)
+parser.add_argument("--lyapunov_rel_margin", type=float, default=0.0)
+parser.add_argument("--lyapunov_window_steps", type=int, default=60)
+parser.add_argument("--lyapunov_min_pass_rate", type=float, default=0.0)
+parser.add_argument(
+    "--lyapunov_v_mode",
+    type=str,
+    default="pose_quadratic",
+    choices=["pose_quadratic", "so3_consistent", "energy_with_rate", "control_lyapunov"],
+    help="M1: Lyapunov V definition. pose_quadratic=legacy 0.5*e^T P e; "
+         "so3_consistent=SO(3) quat_error_magnitude (reward-aligned); "
+         "energy_with_rate=adds 0.5*edot^T Q edot kinetic term; "
+         "control_lyapunov=CLF exponential decay gate dV<=-alpha*V.",
+)
+parser.add_argument("--lyapunov_q_diag", type=str, default="0.0,0.0,0.0,0.0",
+                    help="M1: rate weights Q (roll,pitch,yaw,depth) for energy_with_rate/control_lyapunov.")
+parser.add_argument("--lyapunov_decay_alpha", type=float, default=0.0,
+                    help="M1: CLF exponential decay rate for control_lyapunov gate (dV<=-alpha*V).")
+# M2: directional hard-constraint guard (builds on M1's dV-sign mask).
+# Default 'off' keeps the legacy soft-weighting-only behaviour (零行为变更).
+# When active, the slow-loop update is *rejected* (not just down-weighted) if the
+# batch lacks Lyapunov-descent evidence or its target pull points anti-descent.
+parser.add_argument(
+    "--stdw_dir_guard",
+    type=str,
+    default="off",
+    choices=["off", "pass_rate", "descent_align", "both"],
+    help="M2: directional hard constraint on slow-loop updates (补 §1.1 缺方向性). "
+         "off=legacy soft mask weighting only. pass_rate=reject if descent "
+         "fraction < --stdw_dir_guard_min_pass_rate. descent_align=reject if the "
+         "target loss net-pull points against the Lyapunov descent direction. "
+         "both=require both.",
+)
+parser.add_argument("--stdw_dir_guard_min_pass_rate", type=float, default=0.5,
+                    help="M2: minimum batch Lyapunov-descent fraction (mask=1 share) "
+                         "required to accept an update under pass_rate/both.")
+parser.add_argument("--stdw_dir_guard_align_margin", type=float, default=0.0,
+                    help="M2: minimum descent-alignment score in [-1,1] required under "
+                         "descent_align/both. 0 = reject only net anti-descent batches.")
+parser.add_argument(
+    "--lyapunov_guard_action",
+    type=str,
+    default="skip_slow_loop",
+    choices=["skip_slow_loop", "freeze_drift", "zero_drift"],
+)
+parser.add_argument("--lyapunov_guard_confirm_steps", type=int, default=30)
+parser.add_argument("--lyapunov_guard_recover_steps", type=int, default=30)
 parser.add_argument("--g_C_lr", type=float, default=5e-5)
 parser.add_argument("--lambda_reg", type=float, default=1e-3)
 # Regularization mode: parameter-space L2 (legacy) vs behavior KL on source
@@ -598,6 +651,16 @@ parser.add_argument("--lambda_reg", type=float, default=1e-3)
 parser.add_argument(
     "--reg_mode", type=str, default="behavior_kl", choices=["l2", "behavior_kl"]
 )
+parser.add_argument(
+    "--stdw_update_acceptance",
+    type=str,
+    default="off",
+    choices=["off", "batch_trust"],
+)
+parser.add_argument("--stdw_max_behavior_mse", type=float, default=1.0e-4)
+parser.add_argument("--stdw_max_action_delta_mse", type=float, default=1.0e-3)
+parser.add_argument("--stdw_max_target_mse_increase", type=float, default=1.0e-4)
+parser.add_argument("--stdw_min_effective_batch_frac", type=float, default=0.2)
 parser.add_argument("--target_drift", type=float, default=0.05)
 parser.add_argument("--drift_start_step", type=int, default=200)
 parser.add_argument("--drift_end_step", type=int, default=1200)
@@ -749,7 +812,7 @@ parser.add_argument(
     "--embodiment",
     type=str,
     default="base",
-    choices=["base", "long_body", "heavy_moderate", "asymmetric"],
+    choices=["base", "long_body", "heavy_moderate", "asymmetric", "uuv6", "uuv4", "uuv6_angled", "uuv4_angled"],
 )
 parser.add_argument(
     "--pid_multipliers",
@@ -762,6 +825,61 @@ parser.add_argument(
          "param ∈ {zeta1,zeta2,zeta3}. Useful for re-tuning gains on heavy/asymmetric "
          "embodiments without re-training (option 6.2 in REPORT_scenarios_6k).",
 )
+parser.add_argument(
+    "--ctrl_mismatch",
+    type=str,
+    default=None,
+    help="M3: JSON spec for controller-mismatch injection beyond pid_gain (plug-and-play). "
+         "Applied via env.apply_ctrl_mismatch AFTER pid_multipliers, BEFORE first reset. "
+         "Schema: {\"mode\": \"actuator_scale\", \"thrust_scale\": 0.2} | "
+         "{\"mode\": \"s_surface_struct\", \"s_ratio_scale\": 0.5, \"add_scale\": 0.0} | "
+         "{\"mode\": \"allocation_skew\", \"alloc_scale\": [1,1,0.3,1]}. "
+         "Default None = pid_gain (现状，零行为变更). Designed to break the ~67% mismatch ceiling "
+         "by retargeting the failure to thrust/structural level (see PLAN §4).",
+)
+parser.add_argument(
+    "--boundary_effect",
+    type=str,
+    default=None,
+    help="M4: near-boundary effects (plug-and-play). Either a preset mode string "
+         "({off, residual_buoyancy, free_surface, ground_effect, nonlinear_restoring, full}) "
+         "or a JSON object {\"mode\": \"free_surface\", \"z_surface\": 1.5, ...} whose extra keys "
+         "override BoundaryEffectModels fields. Applied via env.apply_boundary_effect AFTER "
+         "ctrl_mismatch, BEFORE first reset. Default None = off (零行为变更). Models the Sim2Real "
+         "free-surface / ground-effect / residual-buoyancy gap (see PLAN §5, ref/近边界效应.md).",
+)
+# M5: domain-adaptation backend for the slow-loop target anchor (plug-and-play).
+# Default 'opr' keeps the legacy physics-prior pseudo_action path (零行为变更).
+# esuot_full / esuot_light replace B_tgt["pseudo_actions"] with an E-SUOT optimal
+# -transport anchor computed purely from the state-action distribution -- it never
+# reads com_to_cob, J_inv, or the micro-probe (no physical prior; see PLAN §6).
+parser.add_argument(
+    "--domain_adapt_backend",
+    type=str,
+    default="opr",
+    choices=["opr", "esuot_full", "esuot_light", "none"],
+    help="M5: slow-loop target anchor source. opr=legacy pseudo_actions (default, "
+         "physics prior). esuot_full=neural E-SUOT (Algorithm 1, barycentric). "
+         "esuot_light=Sinkhorn barycentric (no NN). none=disable target term. "
+         "esuot_* are prior-free (no com_to_cob/J_inv/micro-probe).",
+)
+parser.add_argument("--esuot_eps", type=float, default=0.1,
+                    help="M5: entropy regularisation ε for the E-SUOT entropic plan.")
+parser.add_argument("--esuot_eta", type=float, default=1.0,
+                    help="M5: discretisation step η; transport cost is 1/(2η)||·||².")
+parser.add_argument("--esuot_lambda1", type=float, default=1.0,
+                    help="M5: unbalanced target-side conjugate weight (Eq.18 λ1).")
+parser.add_argument("--esuot_lambda2", type=float, default=1.0,
+                    help="M5: unbalanced source-side transport weight (Eq.18 λ2).")
+parser.add_argument("--esuot_divergence", type=str, default="kl",
+                    choices=["kl", "chi2", "softplus", "identity"],
+                    help="M5: f-divergence for the conjugate f* (KL = Table 3 best).")
+parser.add_argument("--esuot_inner_iters", type=int, default=50,
+                    help="M5 (esuot_full): epochs per w_φ / T_θ step in Algorithm 1.")
+parser.add_argument("--esuot_num_steps", type=int, default=1,
+                    help="M5 (esuot_full): number of intermediate domains T in Algorithm 1.")
+parser.add_argument("--esuot_sinkhorn_iters", type=int, default=200,
+                    help="M5 (esuot_light): Sinkhorn iterations for the barycentric plan.")
 parser.add_argument(
     "--fault_thrusters",
     type=str,
@@ -882,7 +1000,13 @@ _stdw_buffer_module = _load_module_from_path(
     "_local_stdw_buffer", REPO_ROOT / "utils" / "stdw_buffer.py"
 )
 StdwReplayBuffer = _stdw_buffer_module.StdwReplayBuffer  # type: ignore[attr-defined]
+# M5: E-SUOT domain-adaptation adapter (prior-free target anchor). The package
+# name ``esuot`` is unique (no clash with the ``utils`` namespace package), so a
+# direct import off REPO_ROOT is safe. Only used when --domain_adapt_backend is
+# esuot_full / esuot_light.
+from esuot import AdapterConfig, DomainAdaptAdapter  # noqa: E402
 from easyuuv_stdw_wrapper import EasyUUVStdwWrapper  # noqa: E402
+import stdw_dir_guard  # noqa: E402  (M2 directional hard-constraint guard)
 from stdw_integration import (  # noqa: E402
     STDWCSVLogger,
     angle_remap,
@@ -1111,6 +1235,33 @@ def main() -> None:
         except Exception as exc:
             print(f"[WARN] apply_pid_multipliers({args_cli.pid_multipliers!r}) failed: {exc}")
 
+    # M3: optional controller-mismatch injection beyond pid_gain (plug-and-play).
+    if args_cli.ctrl_mismatch:
+        try:
+            mismatch_spec = json.loads(args_cli.ctrl_mismatch)
+            if not isinstance(mismatch_spec, dict):
+                raise ValueError("ctrl_mismatch must decode to a JSON object")
+            raw_env.unwrapped.apply_ctrl_mismatch(mismatch_spec)
+            print(f"[INFO] applied ctrl_mismatch: {mismatch_spec}")
+        except Exception as exc:
+            print(f"[WARN] apply_ctrl_mismatch({args_cli.ctrl_mismatch!r}) failed: {exc}")
+
+    # M4: optional near-boundary effects (plug-and-play). Accepts either a preset
+    # mode string or a JSON object. Applied after mismatch, before first reset.
+    if args_cli.boundary_effect:
+        try:
+            raw = args_cli.boundary_effect.strip()
+            if raw.startswith("{"):
+                boundary_spec = json.loads(raw)
+                if not isinstance(boundary_spec, dict):
+                    raise ValueError("boundary_effect JSON must decode to an object")
+            else:
+                boundary_spec = raw  # preset mode string
+            raw_env.unwrapped.apply_boundary_effect(boundary_spec)
+            print(f"[INFO] applied boundary_effect: {boundary_spec}")
+        except Exception as exc:
+            print(f"[WARN] apply_boundary_effect({args_cli.boundary_effect!r}) failed: {exc}")
+
     # Compose: EasyUUVStdwWrapper -> RslRlVecEnvWrapper.
     sim_dt = float(getattr(env_cfg.sim, "dt", 1.0 / 120.0))
 
@@ -1151,6 +1302,14 @@ def main() -> None:
         enable_lyapunov_mask=args_cli.enable_lyapunov_mask,
         lyapunov_P_diag=_parse_p_diag(args_cli.lyapunov_p_diag),
         lyapunov_eps=args_cli.lyapunov_eps,
+        lyapunov_gate_mode=args_cli.lyapunov_gate_mode,
+        lyapunov_abs_margin=args_cli.lyapunov_abs_margin,
+        lyapunov_rel_margin=args_cli.lyapunov_rel_margin,
+        lyapunov_window_steps=args_cli.lyapunov_window_steps,
+        lyapunov_min_pass_rate=args_cli.lyapunov_min_pass_rate,
+        lyapunov_v_mode=args_cli.lyapunov_v_mode,
+        lyapunov_Q_diag=_parse_p_diag(args_cli.lyapunov_q_diag),
+        lyapunov_decay_alpha=args_cli.lyapunov_decay_alpha,
     )
     micro_probe = MicroProbeController(
         enabled=bool(args_cli.enable_micro_probe),
@@ -1236,6 +1395,47 @@ def main() -> None:
         except Exception as exc:
             print(f"[WARN] Failed to load resume buffer: {exc}")
 
+    # M5: build the E-SUOT domain-adaptation adapter when a non-OPR backend is
+    # requested. Kept None for the default 'opr'/'none' paths so the legacy
+    # pseudo_action anchor is used unchanged (零行为变更).
+    domain_adapt_adapter = None
+    if args_cli.domain_adapt_backend in ("esuot_full", "esuot_light"):
+        domain_adapt_adapter = DomainAdaptAdapter(
+            AdapterConfig(
+                backend=args_cli.domain_adapt_backend,
+                eps=float(args_cli.esuot_eps),
+                eta=float(args_cli.esuot_eta),
+                lambda1=float(args_cli.esuot_lambda1),
+                lambda2=float(args_cli.esuot_lambda2),
+                divergence=str(args_cli.esuot_divergence),
+                inner_iters=int(args_cli.esuot_inner_iters),
+                num_steps=int(args_cli.esuot_num_steps),
+                sinkhorn_iters=int(args_cli.esuot_sinkhorn_iters),
+                device=str(runtime_device),
+                seed=args_cli.seed,
+            )
+        )
+        print(
+            f"[INFO] M5 domain-adapt backend = {args_cli.domain_adapt_backend} "
+            f"(prior-free E-SUOT anchor; eps={args_cli.esuot_eps}, eta={args_cli.esuot_eta})",
+            flush=True,
+        )
+
+    # M2: directional hard-constraint guard config. Default mode 'off' makes
+    # evaluate() always accept, preserving the legacy soft-mask-only path.
+    dir_guard_cfg = stdw_dir_guard.DirGuardConfig(
+        mode=str(args_cli.stdw_dir_guard),
+        min_pass_rate=float(args_cli.stdw_dir_guard_min_pass_rate),
+        align_margin=float(args_cli.stdw_dir_guard_align_margin),
+    )
+    if dir_guard_cfg.active:
+        print(
+            f"[INFO] M2 directional guard = {dir_guard_cfg.mode} "
+            f"(min_pass_rate={dir_guard_cfg.min_pass_rate}, "
+            f"align_margin={dir_guard_cfg.align_margin})",
+            flush=True,
+        )
+
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     result_run_dir = paths.result_run_dir(args_cli.experiment_name, resolved_load_run, resolved_checkpoint)
     stdw_run_dir = ensure_directory(result_run_dir / f"stdw_new_{timestamp}")
@@ -1301,12 +1501,32 @@ def main() -> None:
         "compound_error",
         "lyapunov_V",
         "lyapunov_dV",
+        "lyapunov_pass",
+        "lyapunov_pass_rate_window",
+        "lyapunov_safety_block",
+        "lyapunov_safety_reason",
+        "stdw_safety_state",
+        "stdw_safety_transition",
+        "stdw_fallback_step",
         "stdw_mask",
         "effective_batch_frac",
         "loss",
         "loss_source",
         "loss_target",
         "loss_reg",
+        "stdw_update_accepted",
+        "stdw_update_rejected",
+        "stdw_acceptance_reason",
+        "stdw_behavior_mse_before",
+        "stdw_behavior_mse_after",
+        "stdw_action_delta_mse",
+        "stdw_target_mse_before",
+        "stdw_target_mse_after",
+        "stdw_dir_guard_pass_rate",
+        "stdw_dir_guard_align",
+        "boundary_submersion_ratio",
+        "boundary_residual_dB",
+        "boundary_ground_mag",
         "control_effort",
         "trigger_gate_silenced",
         "episode_reset",
@@ -1359,6 +1579,21 @@ def main() -> None:
     reset_count = 0
     slow_loop_triggers = 0
     gate_silenced_count = 0
+    lyapunov_block_count = 0
+    lyapunov_zero_drift_count = 0
+    lyapunov_freeze_drift_count = 0
+    stdw_safety_state = "NORMAL"
+    stdw_safety_transition_count = 0
+    stdw_suspect_enter_count = 0
+    stdw_fallback_enter_count = 0
+    stdw_recover_count = 0
+    stdw_guard_harm_streak = 0
+    stdw_guard_clear_streak = 0
+    stdw_fallback_step: Optional[int] = None
+    stdw_update_accepted_count = 0
+    stdw_update_rejected_count = 0
+    stdw_last_reject_reason = ""
+    stdw_dir_guard_blocked_count = 0
     prev_V: Optional[float] = None
     # Baseline compound-error tracker for relative stability threshold (5.2 fix).
     # Collected over the pre-drift window steps in [0, drift_start_step). After the
@@ -1413,6 +1648,55 @@ def main() -> None:
         drift_frac = float(injected.get("stdw_drift_fraction", stdw_wrapper.current_drift()))
         V_t = float(injected.get("stdw_V", 0.0))
         stdw_mask_val = float(injected.get("stdw_mask", 1.0))
+        stdw_dV = float(injected.get("stdw_dV", float("nan")))
+        lyapunov_pass = float(injected.get("stdw_lyap_pass", stdw_mask_val))
+        lyapunov_pass_rate = float(injected.get("stdw_lyap_pass_rate_window", 1.0))
+        lyapunov_safety_block = float(injected.get("stdw_safety_block", 0.0))
+        lyapunov_safety_reason = str(injected.get("stdw_safety_reason", ""))
+        is_lyapunov_blocked = bool(lyapunov_safety_block > 0.0)
+        stdw_safety_transition = ""
+        if is_lyapunov_blocked:
+            lyapunov_block_count += 1
+            stdw_guard_harm_streak += 1
+            stdw_guard_clear_streak = 0
+        else:
+            stdw_guard_harm_streak = 0
+            stdw_guard_clear_streak += 1
+
+        if stdw_safety_state == "NORMAL" and is_lyapunov_blocked:
+            stdw_safety_state = "SUSPECT"
+            stdw_safety_transition = "NORMAL->SUSPECT"
+            stdw_safety_transition_count += 1
+            stdw_suspect_enter_count += 1
+            stdw_wrapper.freeze_current_drift()
+            lyapunov_freeze_drift_count += 1
+        elif stdw_safety_state == "SUSPECT":
+            if (
+                is_lyapunov_blocked
+                and stdw_guard_harm_streak >= max(int(args_cli.lyapunov_guard_confirm_steps), 1)
+            ):
+                stdw_safety_state = "FALLBACK"
+                stdw_safety_transition = "SUSPECT->FALLBACK"
+                stdw_safety_transition_count += 1
+                stdw_fallback_enter_count += 1
+                stdw_fallback_step = step if stdw_fallback_step is None else stdw_fallback_step
+                if args_cli.lyapunov_guard_action == "zero_drift":
+                    stdw_wrapper.target_drift = 0.0
+                    lyapunov_zero_drift_count += 1
+                elif args_cli.lyapunov_guard_action == "freeze_drift":
+                    stdw_wrapper.freeze_current_drift()
+                    lyapunov_freeze_drift_count += 1
+            elif (
+                not is_lyapunov_blocked
+                and stdw_guard_clear_streak >= max(int(args_cli.lyapunov_guard_recover_steps), 1)
+            ):
+                stdw_safety_state = "NORMAL"
+                stdw_safety_transition = "SUSPECT->NORMAL"
+                stdw_safety_transition_count += 1
+                stdw_recover_count += 1
+                stdw_wrapper.clear_drift_freeze()
+
+        lyapunov_guard_blocks_slow_loop = stdw_safety_state in {"SUSPECT", "FALLBACK"}
 
         # ---- pseudo-action ----
         # 改良 2：在 pseudo_gain 上叠加 drift_frac 自适应衰减 + 修正量 clip 门控。
@@ -1463,6 +1747,16 @@ def main() -> None:
         loss_src_val = 0.0
         loss_tgt_val = 0.0
         loss_reg_val = 0.0
+        stdw_update_accepted = 0
+        stdw_update_rejected = 0
+        stdw_acceptance_reason = ""
+        stdw_behavior_mse_before = float("nan")
+        stdw_behavior_mse_after = float("nan")
+        stdw_action_delta_mse = float("nan")
+        stdw_target_mse_before = float("nan")
+        stdw_target_mse_after = float("nan")
+        stdw_dir_guard_pass_rate = float("nan")
+        stdw_dir_guard_align = float("nan")
         effective_batch_frac = 0.0
         triggered_slow = False
         gate_silenced = False
@@ -1475,10 +1769,12 @@ def main() -> None:
         is_triggered = True
         if args_cli.enable_trigger_gate:
             is_triggered = (filt_err >= args_cli.trigger_threshold)
-        if slow_due and not is_triggered:
+        if slow_due and lyapunov_guard_blocks_slow_loop:
+            gate_silenced = True
+        elif slow_due and not is_triggered:
             gate_silenced = True
             gate_silenced_count += 1
-        if slow_due and is_triggered:
+        if slow_due and is_triggered and not lyapunov_guard_blocks_slow_loop:
             triggered_slow = True
             slow_loop_triggers += 1
             rho = float(drift_frac)
@@ -1493,6 +1789,24 @@ def main() -> None:
                 a_tgt_pred = _policy_forward_train(policy, obs_normalizer(B_tgt["states"]))
                 if not a_tgt_pred.requires_grad:
                     raise RuntimeError("policy training forward path is detached")
+
+                # M5: target-anchor source selection.
+                #   opr        -> keep B_tgt["pseudo_actions"] (physics-prior, legacy).
+                #   esuot_*     -> replace it with the prior-free E-SUOT transport anchor
+                #                  derived purely from the state-action distribution.
+                #   none        -> disable the target term (anchor = current prediction,
+                #                  so L_tgt and its gradient vanish).
+                if domain_adapt_adapter is not None:
+                    # The esuot_full backend trains its own potential/transport
+                    # networks internally (needs autograd), so we must NOT disable
+                    # grad here. Inputs come from the (detached) replay buffer and
+                    # the adapter uses separate modules/optimizers, so this stays
+                    # isolated from the policy graph; the anchor is detached below.
+                    with torch.enable_grad():
+                        esuot_anchor = domain_adapt_adapter.compute_target_anchor(B_src, B_tgt)
+                    B_tgt["pseudo_actions"] = esuot_anchor.to(a_tgt_pred.device).detach()
+                elif args_cli.domain_adapt_backend == "none":
+                    B_tgt["pseudo_actions"] = a_tgt_pred.detach()
 
                 # Source / target anchors: frozen reference policy on the same observations.
                 # Replaces B_src["actions"] which would be ≈ policy(obs_src) and
@@ -1545,11 +1859,96 @@ def main() -> None:
                 loss_reg_val = float(L_reg.detach().item()) if isinstance(L_reg, torch.Tensor) else float(L_reg)
                 loss_total = float(loss.detach().item())
 
-                if torch.isfinite(loss) and effective_batch_frac > 0.0:
-                    optimizer.zero_grad(set_to_none=True)
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
-                    optimizer.step()
+                # M2: directional hard-constraint guard. Builds on M1's dV-sign
+                # mask (B_*["stdw_masks"], always recorded in the buffer). When
+                # mode != 'off' this *rejects* the whole update -- rather than
+                # merely down-weighting it -- if the batch lacks Lyapunov-descent
+                # evidence (pass_rate) or its target pull points anti-descent
+                # (descent_align). Evaluated BEFORE the optimizer step so a
+                # rejected batch never perturbs the policy. Default 'off' always
+                # accepts => zero behaviour change.
+                dir_guard_ok, dir_guard_reason, dir_guard_metrics = stdw_dir_guard.evaluate(
+                    dir_guard_cfg,
+                    B_src["stdw_masks"],
+                    B_tgt["stdw_masks"],
+                    mse_tgt,
+                )
+                stdw_dir_guard_pass_rate = dir_guard_metrics["dir_guard_pass_rate"]
+                stdw_dir_guard_align = dir_guard_metrics["dir_guard_align"]
+
+                if not dir_guard_ok:
+                    stdw_update_rejected = 1
+                    stdw_update_rejected_count += 1
+                    stdw_dir_guard_blocked_count += 1
+                    stdw_acceptance_reason = dir_guard_reason
+                    stdw_last_reject_reason = dir_guard_reason
+                elif torch.isfinite(loss) and effective_batch_frac > 0.0:
+                    use_batch_trust = args_cli.stdw_update_acceptance == "batch_trust"
+                    if use_batch_trust:
+                        with torch.no_grad():
+                            stdw_behavior_mse_before = float(
+                                0.5 * (
+                                    ((a_src_pred.detach() - a_src_anchor) ** 2).mean()
+                                    + ((a_tgt_pred.detach() - a_tgt_anchor) ** 2).mean()
+                                ).item()
+                            )
+                            stdw_target_mse_before = float(mse_tgt.detach().mean().item())
+                        if effective_batch_frac < float(args_cli.stdw_min_effective_batch_frac):
+                            stdw_update_rejected = 1
+                            stdw_update_rejected_count += 1
+                            stdw_acceptance_reason = "low_effective_batch_frac"
+                            stdw_last_reject_reason = stdw_acceptance_reason
+                        else:
+                            policy_before = {k: v.detach().clone() for k, v in policy.state_dict().items()}
+                            optimizer_before = copy.deepcopy(optimizer.state_dict())
+                            a_src_before = a_src_pred.detach()
+                            a_tgt_before = a_tgt_pred.detach()
+                            optimizer.zero_grad(set_to_none=True)
+                            loss.backward()
+                            torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
+                            optimizer.step()
+                            with torch.no_grad():
+                                a_src_after = _policy_forward_train(policy, obs_normalizer(B_src["states"]))
+                                a_tgt_after = _policy_forward_train(policy, obs_normalizer(B_tgt["states"]))
+                                stdw_behavior_mse_after = float(
+                                    0.5 * (
+                                        ((a_src_after - a_src_anchor) ** 2).mean()
+                                        + ((a_tgt_after - a_tgt_anchor) ** 2).mean()
+                                    ).item()
+                                )
+                                stdw_action_delta_mse = float(
+                                    0.5 * (
+                                        ((a_src_after - a_src_before) ** 2).mean()
+                                        + ((a_tgt_after - a_tgt_before) ** 2).mean()
+                                    ).item()
+                                )
+                                stdw_target_mse_after = float(((a_tgt_after - B_tgt["pseudo_actions"]) ** 2).mean().item())
+
+                            reject_reasons = []
+                            if stdw_behavior_mse_after > stdw_behavior_mse_before + float(args_cli.stdw_max_behavior_mse):
+                                reject_reasons.append("behavior_mse")
+                            if stdw_action_delta_mse > float(args_cli.stdw_max_action_delta_mse):
+                                reject_reasons.append("action_delta")
+                            if stdw_target_mse_after > stdw_target_mse_before + float(args_cli.stdw_max_target_mse_increase):
+                                reject_reasons.append("target_mse")
+                            if reject_reasons:
+                                policy.load_state_dict(policy_before)
+                                optimizer.load_state_dict(optimizer_before)
+                                stdw_update_rejected = 1
+                                stdw_update_rejected_count += 1
+                                stdw_acceptance_reason = "+".join(reject_reasons)
+                                stdw_last_reject_reason = stdw_acceptance_reason
+                            else:
+                                stdw_update_accepted = 1
+                                stdw_update_accepted_count += 1
+                                stdw_acceptance_reason = "accepted"
+                    else:
+                        optimizer.zero_grad(set_to_none=True)
+                        loss.backward()
+                        torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
+                        optimizer.step()
+                        stdw_update_accepted = 1
+                        stdw_update_accepted_count += 1
             except Exception as exc:
                 print(f"[WARN] slow-loop failure at step {step}: {exc}")
 
@@ -1636,6 +2035,21 @@ def main() -> None:
         except Exception:
             offset_row = [0.0, 0.0, 0.0]
 
+        # M4 boundary diagnostics readout (env_id=0). NaN when M4 is off / absent
+        # so the boundary plot degrades gracefully (zero behaviour change).
+        def _boundary_scalar(key: str) -> float:
+            info = getattr(env.unwrapped, "_last_boundary_info", None)
+            if not info or key not in info:
+                return float("nan")
+            try:
+                return float(info[key][0])
+            except Exception:
+                return float("nan")
+
+        boundary_submersion_ratio = _boundary_scalar("submersion_ratio")
+        boundary_residual_dB = _boundary_scalar("residual_dB")
+        boundary_ground_mag = _boundary_scalar("ground_mag")
+
         done_flag = bool(torch.any(dones > 0).item()) if isinstance(dones, torch.Tensor) else bool(dones)
         if done_flag:
             reset_count += 1
@@ -1654,13 +2068,33 @@ def main() -> None:
             "filtered_error": float(filt_err),
             "compound_error": float(compound_error),
             "lyapunov_V": float(V_t),
-            "lyapunov_dV": float(V_t - prev_V) if prev_V is not None else float("nan"),
+            "lyapunov_dV": float(stdw_dV),
+            "lyapunov_pass": float(lyapunov_pass),
+            "lyapunov_pass_rate_window": float(lyapunov_pass_rate),
+            "lyapunov_safety_block": int(is_lyapunov_blocked),
+            "lyapunov_safety_reason": lyapunov_safety_reason,
+            "stdw_safety_state": stdw_safety_state,
+            "stdw_safety_transition": stdw_safety_transition,
+            "stdw_fallback_step": int(stdw_fallback_step) if stdw_fallback_step is not None else "",
             "stdw_mask": float(stdw_mask_val),
             "effective_batch_frac": float(effective_batch_frac) if triggered_slow else float("nan"),
             "loss": float(loss_total) if triggered_slow else float("nan"),
             "loss_source": float(loss_src_val) if triggered_slow else float("nan"),
             "loss_target": float(loss_tgt_val) if triggered_slow else float("nan"),
             "loss_reg": float(loss_reg_val) if triggered_slow else float("nan"),
+            "stdw_update_accepted": int(stdw_update_accepted),
+            "stdw_update_rejected": int(stdw_update_rejected),
+            "stdw_acceptance_reason": stdw_acceptance_reason,
+            "stdw_behavior_mse_before": float(stdw_behavior_mse_before),
+            "stdw_behavior_mse_after": float(stdw_behavior_mse_after),
+            "stdw_action_delta_mse": float(stdw_action_delta_mse),
+            "stdw_target_mse_before": float(stdw_target_mse_before),
+            "stdw_target_mse_after": float(stdw_target_mse_after),
+            "stdw_dir_guard_pass_rate": float(stdw_dir_guard_pass_rate),
+            "stdw_dir_guard_align": float(stdw_dir_guard_align),
+            "boundary_submersion_ratio": boundary_submersion_ratio,
+            "boundary_residual_dB": boundary_residual_dB,
+            "boundary_ground_mag": boundary_ground_mag,
             "control_effort": float(control_effort),
             "trigger_gate_silenced": int(gate_silenced),
             "episode_reset": int(done_flag),
@@ -1707,7 +2141,9 @@ def main() -> None:
             print(
                 f"## EVALUATION LOG ## [STDW-Slow] Triggered: {is_triggered} "
                 f"(step={step} filt_err={filt_err:.6f} thr={args_cli.trigger_threshold:.6f} "
-                f"gate={'on' if args_cli.enable_trigger_gate else 'off'})",
+                f"gate={'on' if args_cli.enable_trigger_gate else 'off'} "
+                f"lyap_block={int(is_lyapunov_blocked)} state={stdw_safety_state} "
+                f"transition={stdw_safety_transition or '-'} reason={lyapunov_safety_reason})",
                 flush=True,
             )
         if triggered_slow:
@@ -1816,6 +2252,8 @@ def main() -> None:
     # Stationary-window MSE: only steps strictly after drift_end_step (when scenario
     # has fully ramped). Falls back to None if no qualifying rows are present.
     final_mse_after_drift: Optional[float] = None
+    lyapunov_pass_rate_mean: Optional[float] = None
+    effective_batch_frac_mean: Optional[float] = None
     try:
         if "compound_error" in csv_df.columns and "step" in csv_df.columns:
             tail = csv_df[csv_df["step"] > int(args_cli.drift_end_step)]
@@ -1824,6 +2262,14 @@ def main() -> None:
                 vals = tail[signal_col].astype(float).dropna()
                 if len(vals) > 0:
                     final_mse_after_drift = float(vals.mean())
+        if "lyapunov_pass" in csv_df.columns:
+            vals = csv_df["lyapunov_pass"].astype(float).dropna()
+            if len(vals) > 0:
+                lyapunov_pass_rate_mean = float(vals.mean())
+        if "effective_batch_frac" in csv_df.columns:
+            vals = csv_df["effective_batch_frac"].astype(float).dropna()
+            if len(vals) > 0:
+                effective_batch_frac_mean = float(vals.mean())
     except Exception as exc:  # pragma: no cover
         print(f"[WARN] final_mse_after_drift computation failed: {exc}")
 
@@ -1850,6 +2296,17 @@ def main() -> None:
         "initial_com_to_cob_y": float(initial_cob_xy[1]),
         "ramp_shape": str(args_cli.ramp_shape),
         "pid_multipliers": args_cli.pid_multipliers,
+        "ctrl_mismatch": args_cli.ctrl_mismatch,
+        "boundary_effect": args_cli.boundary_effect,
+        "domain_adapt_backend": str(args_cli.domain_adapt_backend),
+        "esuot_eps": float(args_cli.esuot_eps),
+        "esuot_eta": float(args_cli.esuot_eta),
+        "esuot_lambda1": float(args_cli.esuot_lambda1),
+        "esuot_lambda2": float(args_cli.esuot_lambda2),
+        "esuot_divergence": str(args_cli.esuot_divergence),
+        "esuot_inner_iters": int(args_cli.esuot_inner_iters),
+        "esuot_num_steps": int(args_cli.esuot_num_steps),
+        "esuot_sinkhorn_iters": int(args_cli.esuot_sinkhorn_iters),
         "filter_window_seconds": float(args_cli.filter_window_seconds),
         "slow_loop_interval": int(args_cli.slow_loop_interval),
         "batch_size": int(args_cli.batch_size),
@@ -1862,6 +2319,41 @@ def main() -> None:
         "enable_lyapunov_mask": bool(args_cli.enable_lyapunov_mask),
         "lyapunov_eps": float(args_cli.lyapunov_eps),
         "lyapunov_p_diag": list(_parse_p_diag(args_cli.lyapunov_p_diag)),
+        "lyapunov_gate_mode": str(args_cli.lyapunov_gate_mode),
+        "lyapunov_abs_margin": float(args_cli.lyapunov_abs_margin),
+        "lyapunov_rel_margin": float(args_cli.lyapunov_rel_margin),
+        "lyapunov_window_steps": int(args_cli.lyapunov_window_steps),
+        "lyapunov_min_pass_rate": float(args_cli.lyapunov_min_pass_rate),
+        "lyapunov_v_mode": str(args_cli.lyapunov_v_mode),
+        "lyapunov_q_diag": list(_parse_p_diag(args_cli.lyapunov_q_diag)),
+        "lyapunov_decay_alpha": float(args_cli.lyapunov_decay_alpha),
+        "stdw_dir_guard": str(args_cli.stdw_dir_guard),
+        "stdw_dir_guard_min_pass_rate": float(args_cli.stdw_dir_guard_min_pass_rate),
+        "stdw_dir_guard_align_margin": float(args_cli.stdw_dir_guard_align_margin),
+        "stdw_dir_guard_blocked_count": int(stdw_dir_guard_blocked_count),
+        "lyapunov_guard_action": str(args_cli.lyapunov_guard_action),
+        "lyapunov_guard_confirm_steps": int(args_cli.lyapunov_guard_confirm_steps),
+        "lyapunov_guard_recover_steps": int(args_cli.lyapunov_guard_recover_steps),
+        "lyapunov_block_count": int(lyapunov_block_count),
+        "lyapunov_zero_drift_count": int(lyapunov_zero_drift_count),
+        "lyapunov_freeze_drift_count": int(lyapunov_freeze_drift_count),
+        "stdw_safety_state_final": str(stdw_safety_state),
+        "stdw_safety_transition_count": int(stdw_safety_transition_count),
+        "stdw_suspect_enter_count": int(stdw_suspect_enter_count),
+        "stdw_fallback_enter_count": int(stdw_fallback_enter_count),
+        "stdw_recover_count": int(stdw_recover_count),
+        "stdw_fallback_step": int(stdw_fallback_step) if stdw_fallback_step is not None else None,
+        "stdw_update_acceptance": str(args_cli.stdw_update_acceptance),
+        "stdw_max_behavior_mse": float(args_cli.stdw_max_behavior_mse),
+        "stdw_max_action_delta_mse": float(args_cli.stdw_max_action_delta_mse),
+        "stdw_max_target_mse_increase": float(args_cli.stdw_max_target_mse_increase),
+        "stdw_min_effective_batch_frac": float(args_cli.stdw_min_effective_batch_frac),
+        "stdw_update_accepted_count": int(stdw_update_accepted_count),
+        "stdw_update_rejected_count": int(stdw_update_rejected_count),
+        "stdw_last_reject_reason": str(stdw_last_reject_reason),
+        "lyapunov_pass_rate_mean": lyapunov_pass_rate_mean,
+        "effective_batch_frac_mean": effective_batch_frac_mean,
+        "target_drift_final": float(stdw_wrapper.target_drift),
         "total_steps": int(args_cli.total_steps),
         "final_mse": final_mse,
         "convergence_step": convergence_step,

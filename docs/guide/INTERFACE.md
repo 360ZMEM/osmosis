@@ -5,7 +5,7 @@
 
 ---
 
-## 0. TL;DR：实验前必须知道的 5 件事
+## 0. TL;DR：实验前必须知道的 6 件事
 
 1. JONSWAP 的 `hs/fp/gamma/depth/direction` **没有** CLI 暴露，必须走 `--workflow_config <yaml>` 注入
    `env.disturbance_cfg.jonswap_*`。
@@ -16,6 +16,9 @@
    （`enable_pe / enable_deadzone / enable_param_lpf / identity_init`）+ 2 个数值旋钮（`gain_beta / pe_amp`）的开环参数化映射。
 5. 元控制 8 维任务 `EasyUUV-Direct-Parametric-v1` 与基线 4 维任务 `EasyUUV-Direct-v1` 的 ckpt 不通用，
    experiment_name 也不同（`easyuuv_parametric` vs `easyuuv_direct`）。
+6. `asymmetric` + STDW 安全压测必须显式关闭 OPR/router/probe，并用 matched
+   `--use_stdw False --target_drift 0` 作硬基线；专项入口见
+   `workflows/sweep_stdw_safety_pressure.py`。
 
 ---
 
@@ -120,6 +123,8 @@ env:
 | `--enable_filter` / `--use_quantile_filter` | True / False | RMS 滤波 / 分位数过滤 |
 | `--enable_pseudo_action` | True | 物理修正动作伪标签 |
 | `--enable_lyapunov_mask` | True | Lyapunov 物理滤网 |
+| `--lyapunov_gate_mode` | sample_mask | sample_mask / strict_sample_mask / guarded_drift |
+| `--lyapunov_guard_action` | skip_slow_loop | guarded_drift 下可 skip_slow_loop / freeze_drift / zero_drift |
 | `--reg_mode` | l2 | L2 / behavior_kl 锚定 |
 | `--slow_loop_interval` | 60 | 慢环触发间隔（step） |
 | `--lambda_reg` / `--g_C_lr` | 1e-3 / 5e-5 | 锚定权 / 慢环 lr |
@@ -146,6 +151,19 @@ env:
 `baseline_compound_error_mean`、`slow_loop_triggers`、`reset_count`、`final_mse_after_drift`（m²）、
 `use_stdw`、`enable_filter`、`embodiment`、`scenario`、加 `**tracking_mse_summary`（详见
 `workflows/play_stdw_adapt.py` 末尾段）。
+
+### 3.5 安全压测入口
+
+`workflows/sweep_stdw_safety_pressure.py` 是“小而硬”的专项矩阵，不替代 C4 full matrix。
+
+- Lyapunov/asymmetric 验收：强制 `--auto_drift_router False --enable_micro_probe False --drift_router_mode off`。
+- 控制器 mismatch：用 `play_stdw_adapt.py --pid_multipliers '<json>'` 注入，例如
+  `{"depth_zeta1": 0.01}` 或全轴 `zeta1/zeta2` 乘 `0.01`。
+- 360 度后空翻：通过 `env.reference_mode=flip360_sine` 和 `ref_sine_amp=[π,π,0]`
+  注入，示例 config 为 `workflows/configs/pressure_flip360_medium_full.yaml`。
+
+专项脚本输出 `pressure_runs.csv`、`pressure_summary.json`、`pressure_report.md`，
+其中 `pass_vs_off` 使用 matched clean off 基线做硬判据。
 
 ---
 

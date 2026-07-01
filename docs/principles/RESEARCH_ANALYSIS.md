@@ -114,7 +114,7 @@
 
 `eval/policy_loader.py` 现已支持 ONNX。下一步把 `obs_from_state` 包成
 ROS topic 订阅 + `act` 发布到 thruster，写一个端到端 ROS demo
-（参见 [`docs/EVAL_SOP.md`](../guide/EVAL_SOP.md) §4）。
+（参见 [`EVAL_SOP.md`](../guide/EVAL_SOP.md) §4）。
 
 ### P6. JONSWAP 时变（沿任务周期变化海况）
 
@@ -138,20 +138,24 @@ ROS topic 订阅 + `act` 发布到 thruster，写一个端到端 ROS demo
 ## 5. 复现命令（论文级 sanity check）
 
 ```bash
-# 1. 跑全矩阵
-python workflows/sweep_full_matrix.py \
-    --policy /abs/path/to/model_1499.pt \
-    --output_dir .results/repro_$(date +%Y%m%d)
+# 1. 跑当前 A3 stage2 全矩阵
+bash custom_workflows/run_with_isaac_env.sh workflows/sweep_full_matrix.py \
+    --policy_path logs/rsl_rl/easyuuv_parametric/2026-06-08_13-48-14_stage2/model_2398.pt \
+    --out_root .results/sweep_a3_stage2_$(date +%Y%m%d_%H%M%S) \
+    --total_steps 1500 --seeds 0
 
 # 2. 聚合
-python workflows/tools/aggregate_full_matrix.py \
-    --run_dir .results/repro_$(date +%Y%m%d)
+bash custom_workflows/run_with_isaac_env.sh workflows/tools/aggregate_full_matrix.py \
+    --matrix_dir .results/sweep_a3_stage2_<timestamp>
 
 # 3. 关键三个数（从 stdw_pairwise.csv 读出来）
-#    calm × base × identity:        Δfmse ≈ −43.7%
-#    medium × asymmetric × full:    Δfmse ≈ −44.0%
-#    storm × heavy_moderate × full: Δfmse ≈ +30.4%（异常点必须复现）
+#    base mean over wave×tune:           Δfmse ≈ −67.8%
+#    long_body mean over wave×tune:      Δfmse ≈ −65.2%
+#    asymmetric mean over wave×tune:     Δfmse ≈ +158%（异常点必须复现）
 ```
 
 如果三个数偏差超过 ±5%，先检查 [`ERROR_CASES.md`](../guide/ERROR_CASES.md) §1（JONSWAP 注入）和
 §3（STDW 双关基线）。
+
+完整命令契约以 [`COMMAND_CONTRACT.md`](../guide/COMMAND_CONTRACT.md) 为准；旧
+`model_1499.pt` 复现路径仅保留在 `docs/archive/` 作为历史对照。

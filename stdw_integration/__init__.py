@@ -9,5 +9,7 @@ from .plots import (
     plot_losses,
     plot_actions,
     plot_domain,
+    plot_lyapunov_guard,
+    plot_boundary_wrench,
     plot_stdw_diagnostics,
 )

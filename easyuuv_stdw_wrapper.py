@@ -53,6 +53,14 @@ class EasyUUVStdwWrapper(gym.Wrapper):
         enable_lyapunov_mask: bool = True,
         lyapunov_P_diag: Tuple[float, float, float, float] = (1.0, 1.0, 1.0, 1.0),
         lyapunov_eps: float = 0.0,
+        lyapunov_gate_mode: str = "sample_mask",
+        lyapunov_abs_margin: float = 0.0,
+        lyapunov_rel_margin: float = 0.0,
+        lyapunov_window_steps: int = 60,
+        lyapunov_min_pass_rate: float = 0.0,
+        lyapunov_v_mode: str = "pose_quadratic",
+        lyapunov_Q_diag: Tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0),
+        lyapunov_decay_alpha: float = 0.0,
     ) -> None:
         super().__init__(env)
         self.drift_start_step = int(drift_start_step)
@@ -69,12 +77,48 @@ class EasyUUVStdwWrapper(gym.Wrapper):
         self.error_signal_callable = error_signal_callable
         self.enable_lyapunov_mask = bool(enable_lyapunov_mask)
         self.lyapunov_eps = float(lyapunov_eps)
+        lyapunov_gate_mode = str(lyapunov_gate_mode).lower()
+        if lyapunov_gate_mode not in {"sample_mask", "strict_sample_mask", "guarded_drift"}:
+            raise ValueError(
+                "lyapunov_gate_mode must be sample_mask/strict_sample_mask/guarded_drift, "
+                f"got {lyapunov_gate_mode!r}"
+            )
+        self.lyapunov_gate_mode = lyapunov_gate_mode
+        self.lyapunov_abs_margin = float(lyapunov_abs_margin)
+        self.lyapunov_rel_margin = float(lyapunov_rel_margin)
+        self.lyapunov_window_steps = max(int(lyapunov_window_steps), 1)
+        self.lyapunov_min_pass_rate = float(lyapunov_min_pass_rate)
+
+        # M1: Lyapunov V redefinition (plug-and-play; default pose_quadratic = legacy).
+        lyapunov_v_mode = str(lyapunov_v_mode).lower()
+        if lyapunov_v_mode not in {
+            "pose_quadratic",
+            "so3_consistent",
+            "energy_with_rate",
+            "control_lyapunov",
+        }:
+            raise ValueError(
+                "lyapunov_v_mode must be pose_quadratic/so3_consistent/energy_with_rate/"
+                f"control_lyapunov, got {lyapunov_v_mode!r}"
+            )
+        self.lyapunov_v_mode = lyapunov_v_mode
+        q_tuple = tuple(float(v) for v in lyapunov_Q_diag)
+        if len(q_tuple) != 4:
+            raise ValueError("lyapunov_Q_diag must contain exactly 4 rate weights (roll, pitch, yaw, depth)")
+        self._Q_diag = torch.tensor(q_tuple, dtype=torch.float32)
+        self.lyapunov_decay_alpha = float(lyapunov_decay_alpha)
+        # Rate state for energy_with_rate / control_lyapunov: previous error vector.
+        self._e_prev: Optional[torch.Tensor] = None
 
         window_steps = max(int(round(self.filter_window_seconds / max(self.sim_dt_seconds, 1.0e-6))), 1)
         self._error_window: collections.deque = collections.deque(maxlen=window_steps)
+        self._lyap_pass_window: collections.deque = collections.deque(maxlen=self.lyapunov_window_steps)
+        self._baseline_V_window: collections.deque = collections.deque(maxlen=self.lyapunov_window_steps)
+        self._baseline_error_window: collections.deque = collections.deque(maxlen=self.lyapunov_window_steps)
         self._step_count: int = 0
         self._base_offset: Optional[torch.Tensor] = None
         self._V_prev: Optional[float] = None
+        self._frozen_drift_frac: Optional[float] = None
 
         # Device-aware P_diag tensor; lazily moved when we first see the env tensor.
         p_tuple = tuple(float(v) for v in lyapunov_P_diag)
@@ -83,7 +127,7 @@ class EasyUUVStdwWrapper(gym.Wrapper):
         self._P_diag = torch.tensor(p_tuple, dtype=torch.float32)
 
         # Convenience handles populated each step.
-        self.last_extras: Dict[str, float] = {}
+        self.last_extras: Dict[str, float | str] = {}
         self.last_low_level: Dict[str, torch.Tensor] = {}
 
     # ------------------------------------------------------------------
@@ -102,19 +146,28 @@ class EasyUUVStdwWrapper(gym.Wrapper):
 
     def _compute_drift_fraction(self, step: int) -> float:
         if step <= self.drift_start_step:
-            return 0.0
-        if self.ramp_shape == "step":
-            return 1.0
-        if step >= self.drift_end_step:
-            return 1.0
-        denom = max(self.drift_end_step - self.drift_start_step, 1)
-        linear_frac = float(step - self.drift_start_step) / float(denom)
-        if self.ramp_shape == "cosine":
-            # Smooth s-curve: 0 -> 1 with zero derivative at both ends.
-            # 0.5 * (1 - cos(pi * x)) maps [0,1] -> [0,1] smoothly.
-            import math as _m
-            return 0.5 * (1.0 - _m.cos(_m.pi * linear_frac))
-        return linear_frac
+            frac = 0.0
+        elif self.ramp_shape == "step" or step >= self.drift_end_step:
+            frac = 1.0
+        else:
+            denom = max(self.drift_end_step - self.drift_start_step, 1)
+            linear_frac = float(step - self.drift_start_step) / float(denom)
+            if self.ramp_shape == "cosine":
+                # Smooth s-curve: 0 -> 1 with zero derivative at both ends.
+                # 0.5 * (1 - cos(pi * x)) maps [0,1] -> [0,1] smoothly.
+                import math as _m
+                frac = 0.5 * (1.0 - _m.cos(_m.pi * linear_frac))
+            else:
+                frac = linear_frac
+        if self._frozen_drift_frac is not None:
+            frac = min(frac, float(self._frozen_drift_frac))
+        return frac
+
+    def freeze_current_drift(self) -> None:
+        self._frozen_drift_frac = self._compute_drift_fraction(self._step_count)
+
+    def clear_drift_freeze(self) -> None:
+        self._frozen_drift_frac = None
 
     def _apply_drift(self, step: int) -> float:
         self._capture_base_offset()
@@ -164,25 +217,130 @@ class EasyUUVStdwWrapper(gym.Wrapper):
         except Exception:
             return torch.zeros(4, dtype=torch.float32)
 
-    def _compute_lyapunov_mask(self) -> Tuple[float, float]:
-        e = self._read_channel_error_vec()
+    def _read_so3_error_vec(self) -> torch.Tensor:
+        """M1 V-B: SO(3)-consistent error, aligned with reward/metrics quat_error_magnitude.
+
+        Returns a 4-vector ``[e_att, 0, 0, depth_err]`` so the same diagonal P
+        weighting applies: ``P[0]`` weights the SO(3) attitude geodesic error and
+        ``P[3]`` weights depth.  Channels 1/2 are zeroed (attitude collapses to a
+        single geodesic magnitude), avoiding the Euler wrap discontinuities that
+        corrupt V under flip360 large-angle references.
+        """
+        env = self.env.unwrapped
+        try:
+            from omni.isaac.lab.utils.math import quat_error_magnitude  # type: ignore
+
+            goal_quat = env._goal[0:1, 0:4]
+            root_quat = env._robot.data.root_quat_w[0:1, 0:4]
+            e_att = float(quat_error_magnitude(goal_quat, root_quat)[0].item())
+            true_z = float(env._robot.data.root_pos_w[0][2].item())
+            des_depth = float(getattr(env.cfg, "starting_depth", 1.5))
+            depth_err = des_depth - true_z
+            return torch.tensor([e_att, 0.0, 0.0, depth_err], dtype=torch.float32)
+        except Exception:
+            return self._read_channel_error_vec()
+
+    def _error_vec_for_mode(self) -> torch.Tensor:
+        if self.lyapunov_v_mode == "so3_consistent":
+            e = self._read_so3_error_vec()
+        else:
+            e = self._read_channel_error_vec()
         if e.ndim > 1:
             e = e[0]
         if e.numel() < 4:
             pad = torch.zeros(4, dtype=torch.float32)
-            pad[: e.numel()] = e
-            e = pad
-        else:
-            e = e[:4]
+            pad[: e.numel()] = e.to(dtype=torch.float32)
+            return pad
+        return e[:4].to(dtype=torch.float32)
+
+    def _compute_V(self, e: torch.Tensor) -> Tuple[float, torch.Tensor]:
+        """Return (V_t, e_dot) for the active v_mode.
+
+        ``e_dot`` (error rate, finite difference over one step) is only folded
+        into V for ``energy_with_rate`` / ``control_lyapunov``; otherwise it is
+        returned for bookkeeping but contributes zero energy.
+        """
         p = self._P_diag.to(e.device)
-        V_t = 0.5 * float(torch.sum(p * (e ** 2)).item())
-        if not self.enable_lyapunov_mask:
-            return V_t, 1.0
+        V_pose = 0.5 * float(torch.sum(p * (e ** 2)).item())
+        if self._e_prev is not None and self._e_prev.shape == e.shape:
+            dt = max(self.sim_dt_seconds, 1.0e-6)
+            e_dot = (e - self._e_prev.to(e.device)) / dt
+        else:
+            e_dot = torch.zeros_like(e)
+        if self.lyapunov_v_mode in {"energy_with_rate", "control_lyapunov"}:
+            q = self._Q_diag.to(e.device)
+            V_rate = 0.5 * float(torch.sum(q * (e_dot ** 2)).item())
+            return V_pose + V_rate, e_dot
+        return V_pose, e_dot
+
+    def _compute_lyapunov_mask(self) -> Tuple[float, float, float, float]:
+        e = self._error_vec_for_mode()
+        V_t, e_dot = self._compute_V(e)
+        self._e_prev = e.detach().clone()
         if self._V_prev is None:
-            return V_t, 0.0
-        dV = V_t - self._V_prev
-        mask = 1.0 if dV < self.lyapunov_eps else 0.0
-        return V_t, mask
+            dV = float("nan")
+        else:
+            dV = V_t - self._V_prev
+        if not self.enable_lyapunov_mask:
+            return V_t, 1.0, dV, 1.0
+        if self._V_prev is None:
+            return V_t, 0.0, dV, 0.0
+
+        if self.lyapunov_v_mode == "control_lyapunov":
+            # CLF-style exponential decay: dV <= -alpha * V_prev (and still < 0).
+            alpha = abs(self.lyapunov_decay_alpha)
+            passed = dV < -alpha * max(abs(self._V_prev), 0.0)
+        elif self.lyapunov_gate_mode in {"strict_sample_mask", "guarded_drift"}:
+            abs_ok = dV < -abs(self.lyapunov_abs_margin)
+            rel_ok = False
+            if abs(self._V_prev) > 1.0e-9:
+                rel_ok = (dV / max(abs(self._V_prev), 1.0e-9)) < -abs(self.lyapunov_rel_margin)
+            passed = abs_ok or rel_ok
+        else:
+            passed = dV < self.lyapunov_eps
+        mask = 1.0 if passed else 0.0
+        return V_t, mask, dV, mask
+
+    @staticmethod
+    def _mean_window(values: collections.deque) -> Optional[float]:
+        finite = [float(v) for v in values if math.isfinite(float(v))]
+        if not finite:
+            return None
+        return sum(finite) / float(len(finite))
+
+    def _compute_safety_block(self, V_t: float, filt_err: float, lyap_pass: float) -> Tuple[float, float, str]:
+        self._lyap_pass_window.append(float(lyap_pass))
+        pass_rate = self._mean_window(self._lyap_pass_window)
+        pass_rate_f = 1.0 if pass_rate is None else float(pass_rate)
+
+        if self._step_count <= self.drift_start_step:
+            self._baseline_V_window.append(float(V_t))
+            self._baseline_error_window.append(float(filt_err))
+            return 0.0, pass_rate_f, ""
+
+        if self.lyapunov_gate_mode != "guarded_drift":
+            return 0.0, pass_rate_f, ""
+
+        baseline_V = self._mean_window(self._baseline_V_window)
+        baseline_err = self._mean_window(self._baseline_error_window)
+        reasons: list[str] = []
+        if (
+            self.lyapunov_min_pass_rate > 0.0
+            and len(self._lyap_pass_window) >= self.lyapunov_window_steps
+            and pass_rate_f < self.lyapunov_min_pass_rate
+        ):
+            reasons.append("low_pass_rate")
+        if baseline_V is not None:
+            threshold = baseline_V * (1.0 + max(self.lyapunov_rel_margin, 0.0)) + max(self.lyapunov_abs_margin, 0.0)
+            if V_t > threshold:
+                reasons.append("V_above_baseline")
+        if baseline_err is not None:
+            threshold = baseline_err * (1.0 + max(self.lyapunov_rel_margin, 0.0)) + max(self.lyapunov_abs_margin, 0.0)
+            if filt_err > threshold:
+                reasons.append("error_above_baseline")
+        if reasons:
+            return 1.0, pass_rate_f, "+".join(reasons)
+        return 0.0, pass_rate_f, ""
 
     def _default_error_signal(self) -> float:
         # Fallback: derive compound error from channel error vec (sum of squares).
@@ -233,7 +391,8 @@ class EasyUUVStdwWrapper(gym.Wrapper):
         frac = self._apply_drift(self._step_count)
         raw_err = self._compute_raw_error()
         filt_err = self._filter_error(raw_err)
-        V_t, stdw_mask = self._compute_lyapunov_mask()
+        V_t, stdw_mask, dV_t, lyap_pass = self._compute_lyapunov_mask()
+        safety_block, lyap_pass_rate, safety_reason = self._compute_safety_block(V_t, filt_err, lyap_pass)
         self._V_prev = V_t
         self._capture_low_level()
 
@@ -244,6 +403,11 @@ class EasyUUVStdwWrapper(gym.Wrapper):
             "stdw_step": int(self._step_count),
             "stdw_V": float(V_t),
             "stdw_mask": float(stdw_mask),
+            "stdw_dV": float(dV_t),
+            "stdw_lyap_pass": float(lyap_pass),
+            "stdw_lyap_pass_rate_window": float(lyap_pass_rate),
+            "stdw_safety_block": float(safety_block),
+            "stdw_safety_reason": str(safety_reason),
         }
 
         if isinstance(extras, dict):
@@ -262,6 +426,7 @@ class EasyUUVStdwWrapper(gym.Wrapper):
         result = self.env.reset(*args, **kwargs)
         self._error_window.clear()
         self._V_prev = None
+        self._e_prev = None
         # Re-apply current drift after env's _reset_domain may have restored base offsets.
         self._apply_drift(self._step_count)
         return result

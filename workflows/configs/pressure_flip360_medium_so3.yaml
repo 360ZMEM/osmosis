@@ -1,0 +1,26 @@
+env:
+  tune_gains: true
+  identity_init: false
+  enable_pe: true
+  enable_deadzone: true
+  enable_param_lpf: true
+  # === SO(3) 流形 S 面（Phase 1 eval）===
+  # 必须与训练 run 2026-07-01_20-15-47_flip360_so3_p1_stage0 的 env.yaml 完全一致，
+  # 否则 policy 残差与控制律不匹配，eval 无效。
+  attitude_error_mode: so3
+  action_lim_vec: [0.6, 0.6, 0.3, 1.0]
+  geo_zeta1: 1.0
+  geo_zeta2: 0.5
+  geo_residual_scale: 0.5
+  reference_mode: flip360_sine
+  ref_sine_amp: [3.1415926, 3.1415926, 0.0]
+  ref_sine_freq: [0.05, 0.05, 0.0]
+  disturbance_cfg:
+    mode: jonswap
+    base_vel: [0.08, 0.0, 0.03]
+    jonswap_hs: 0.8
+    jonswap_fp: 0.14
+    jonswap_gamma: 3.3
+    jonswap_depth: 30.0
+    jonswap_direction: 0.0
+    jonswap_seed: 11

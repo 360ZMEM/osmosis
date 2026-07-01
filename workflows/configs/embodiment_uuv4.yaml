@@ -1,0 +1,31 @@
+env:
+  # uuv4: under-actuated vertical-thruster layout. Roll/pitch/depth only; yaw challenge disabled.
+  attitude_error_mode: so3
+  action_lim_vec: [0.6, 0.6, 0.3, 1.0]
+  geo_zeta1: 1.0
+  geo_zeta2: 0.5
+  geo_residual_scale: 0.5
+
+  reference_mode: flip360_sine
+  ref_sine_amp: [3.1415926, 3.1415926, 0.0]
+  ref_sine_freq: [0.04, 0.04, 0.0]
+
+  # Submerge-then-flip360 protocol.
+  # Safety: starting_depth/submerge_depth < z_surface_guard - vehicle_height/2 - surface_margin.
+  starting_depth: 1.5
+  submerge_phase_enable: true
+  submerge_depth: 1.5
+  submerge_hold_steps: 140
+  surface_guard_enable: true
+  surface_margin: 0.15
+  z_surface_guard: 3.0
+
+  disturbance_cfg:
+    mode: jonswap
+    base_vel: [0.06, 0.0, 0.02]
+    jonswap_hs: 0.6
+    jonswap_fp: 0.12
+    jonswap_gamma: 3.3
+    jonswap_depth: 30.0
+    jonswap_direction: 0.0
+    jonswap_seed: 22

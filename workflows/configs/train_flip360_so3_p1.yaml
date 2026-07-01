@@ -1,0 +1,42 @@
+train:
+  run_name: flip360_so3_p1
+  max_iterations: 150
+
+env:
+  tune_gains: true
+  identity_init: false
+  enable_pe: true
+  enable_deadzone: true
+  enable_param_lpf: true
+  # === SO(3) 流形 S 面升级（Phase 1）===
+  # so3 模式：PID_value[0:3] 由四元数误差 e_R + body 角速度误差 e_omega 直接向量化 S 面，
+  # 规避欧拉奇异/通道解耦。s_ratio·geo_zeta1·e_R 在大姿态误差处自动饱和 sigmoid → 满 PWM，
+  # 解除旧 euler 路径 action_lim=0.15 的 10.43Nm 软封印。
+  attitude_error_mode: so3
+  # 抬高 action_lim（roll/pitch 0.15→0.6）：so3 模式下主要放大 RL 残差权威；
+  # 同时保持对 euler 回退路径的解封语义一致。若收敛不足再拍板是否继续抬高 / 扩 18 维。
+  action_lim_vec: [0.6, 0.6, 0.3, 1.0]
+  geo_zeta1: 1.0          # e_R 增益（进 sigmoid）
+  geo_zeta2: 0.5          # e_omega 增益（阻尼）
+  geo_residual_scale: 0.5 # 残差 RL：策略在解析基线上学修正（保 12 维 obs，从 model_2846 fine-tune）
+  # geo_channel_sign 用默认 [-1, 1, -1]（数值标定的分配矩阵 restoring 符号，勿改）
+  reference_mode: mixed_sine_flip360
+  ref_mix_flip_prob: 0.5
+  ref_sine_amp: [3.1415926, 3.1415926, 0.0]
+  ref_sine_freq: [0.05, 0.05, 0.0]
+  ref_mix_sine_amp: [0.35, 0.35, 0.35]
+  ref_mix_sine_freq: [0.18, 0.22, 0.15]
+  disturbance_cfg:
+    mode: jonswap
+    base_vel: [0.08, 0.0, 0.03]
+    jonswap_hs: 0.8
+    jonswap_fp: 0.14
+    jonswap_gamma: 3.3
+    jonswap_depth: 30.0
+    jonswap_direction: 0.0
+    jonswap_seed: 11
+
+agent:
+  algorithm:
+    learning_rate: 8.0e-5
+    entropy_coef: 0.002

@@ -4,6 +4,316 @@
 
 ---
 
+## 2026-07-01 — 多 Embodiment + 配置化推力分配 (TAM) + 下沉后 flip360 近边界（基础设施）
+
+**背景**
+- 需要跨形态泛化能力：从"仅质量/惯量变体"扩展到**推进器数量/布局/朝向都不同**的机型族
+  （全驱 6 推、欠驱动 4 推、非正交变种），并把 REMUS 型单推 + 舵面 AUV 作差距分析。
+- 推力分配此前硬编码在三处（`_pid_control` 混合块、`get_thruster_com_and_orientations`
+  几何、散布的 `8` 字面量），无法承载非正交/任意 N 推进器。核心设计：控制律不变，
+  非正交与形态差异全部由**分配层**的伪逆 B⁺ 吸收——最小侵入、最大复用现有 ckpt。
+
+**两处拍板**
+- **REMUS 本轮 skip 实施**，仅文档记录设计 + 差距分析（∝U²·δ 零速不可转向，与矢量推进器
+  本质不同；忠实移植需 Fossen 附加质量/科氏/阻尼，PhysX 刚体积分不足）。
+- **TAM 采用 config 驱动 B⁺，base/asym 保持旧硬编码路径**（保 A4 零行为变更与 model_2398 复现）。
+
+**新增（文档，本轮先落地）**
+- `docs/guide/EMBODIMENT_ZOO.md`：面向用户的多机型手册（9 节：机型总览/物理参数设计表/
+  推进器排布/下沉后 flip360 协议/差异化任务/REMUS 文档态/ckpt 适用矩阵/命令示例/
+  M1–M6 默认启用速查表）。INDEX guide 区补第 8 行。
+- `docs/principles/PAPER_ADDENDUM_multi_embodiment_20260701.md`：面向论文的附录骨架（9 节
+  + 英文草稿，实验数值全 `【TODO】` 占位，商业 AUV 引用点标 `【有东西说：cite …】`）。
+  INDEX principles 区补第 8 行。
+
+**新增（代码/config，opt-in，默认零行为变更）**
+- `thrust_allocation.py`：`ThrusterLayout` + `build_wrench_matrix(layout)->B(6,N)` +
+  `allocate(B, wrench_cmd, mode)`（pinv / wls）。body 6-DOF 顺序
+  `[Fx,Fy,Fz,Tx,Ty,Tz]`，控制通道 `[roll,pitch,yaw,depth]`→`[Tx,Ty,Tz,Fz]`。
+- `easyuuv_env.py`：`embodiment_configs` 新增 `uuv6/uuv4/uuv6_angled/uuv4_angled`（可选键
+  `thrust_allocation`/`volume`/`action_lim_vec`/`num_thrusters`）；`apply_embodiment_config`
+  增 config 分配分支（构建 `self._alloc_B`/`_alloc_mode`/`_alloc_weight`，
+  `_num_thrusters` 传入 `DynamicsFirstOrder`）；分配路径分叉 `self._use_config_alloc`
+  （默认 False→base/asym 走旧混合块）；`8` 字面量改读 `self._num_thrusters`（默认 8）；
+  推进器效率/失配 buffer 随 N 重建，避免 4/6 推运行期形状错配。
+- `easyuuv_env.py`：下沉-then-flip360 两相位机（`submerge_phase_enable`/`submerge_depth`/
+  `submerge_hold_steps`，默认关）+ 水面破面守卫（`surface_guard_enable`/`surface_margin`，
+  默认关）。安全关系式 `submerge_depth < z_surface_guard − vehicle_height/2 − surface_margin`（默认 <2.7）。
+- `workflows/configs/embodiment_{uuv6,uuv4,uuv6_angled,uuv4_angled,submerge_flip360}.yaml`：
+  差异化 reference（欠驱动 yaw 幅置 0）+ submerge/surface_guard + wave block。
+- `workflows/play_stdw_adapt.py`：`--embodiment` choices 追加四新机型。
+- `workflows/sweep_stdw_safety_pressure.py`：新增 profile `embodiment_zoo`。
+
+**验证（本轮非 Isaac）**
+- `python3 -m py_compile thrust_allocation.py easyuuv_env.py workflows/play_stdw_adapt.py workflows/sweep_stdw_safety_pressure.py` 全过。
+- `python3 workflows/tools/test_thrust_allocation.py` 全过：8 推几何 `B` 与运行期 `quat_apply + cross`
+  一致；config B⁺ 通道解耦；旧硬编码混合块净力矩符号与 `geo_channel_sign=[-1,+1,-1]`
+  一致；uuv4 WLS 屏蔽 yaw。
+- `python3 workflows/sweep_stdw_safety_pressure.py --profile embodiment_zoo --dry_run --limit 3 --total_steps 10`
+  冒烟通过；5 个 `embodiment_*.yaml` 均通过 `yaml.safe_load` 静态解析。
+
+**契约**
+- C1–C5 主命令契约不改。新机型 + 下沉相位 + 水面守卫均为 opt-in，默认旧 baseline 行为。
+
+---
+
+## 2026-07-01 — SO(3) 流形 S-Surface 升级 Phase 1（力矩解封 + 几何姿态误差，默认零行为变更）
+
+**背景**
+- Flip360（满 ±π 后空翻）此前经 F1–F4 判定触及架构边界，两个真凶：
+  (1) 力矩预算被算法阉割——固定 `action_lim=0.15` + S 面 sigmoid 截断把 pitch 可用力矩
+      卡在 10.43Nm < asym 最坏浮力回正 15.89Nm；(2) 欧拉奇异 + 三通道解耦在大机动下破产。
+- 方案：把 S-Surface 从 1D 逐轴解耦升级到 SO(3) 流形 3D 向量化（保留 sigmoid 内核）。
+
+**新增（`easyuuv_env.py`，全部 cfg 开关，默认 = 旧 euler 行为）**
+- `EasyUUVEnvCfg` 新增字段：`attitude_error_mode`（默认 `"euler"`）、
+  `action_lim_vec`（默认 `[0.15, 0.15, 0.3, 1.0]` = 旧硬编码）、`geo_zeta1/geo_zeta2`
+  （1.0/0.5）、`geo_residual_scale`（0.0）、`geo_channel_sign`（`[-1.0, 1.0, -1.0]`）。
+- `_so3_attitude_error()`：body-frame 姿态误差 `e_R = 2·sgn(w)·vec(q_curr⁻¹⊗q_goal)`；
+  角速度误差 `e_omega = ω_desired − ω_body`，`ω_desired` 由相邻两步 goal 四元数有限差分
+  得到（首步 `_goal_prev==goal` → 0），规避欧拉率在 ±π 附近奇异。
+- `_pid_control` so3 分支：`PID_value[0:3] = (2/(1+exp(-s_ratio·(ζ1·e_R+ζ2·e_omega
+  +res·a)))−1)·geo_channel_sign`；depth 通道（3）保持旧逐轴逻辑。大姿态误差处
+  `s_ratio·ζ1·e_R` 自动饱和 sigmoid → 满 PWM 权威，解除 10.43Nm 软封印。
+- `_goal_prev` 缓冲 + reset/`_update_reference` 快照（供有限差分求 ω_d）。
+- `action_lim` 改为读 `cfg.action_lim_vec`；`_geo_channel_sign` 在 init 缓存。
+
+**关键修正（数值标定分配矩阵符号）**
+- `/tmp/alloc_sign_check.py` 用真实推进器几何算出单位命令的净 body 力矩：
+  roll τx=−0.84、pitch τy=+0.516、yaw τz=−0.56。固定手工分配矩阵对 roll/yaw 通道**反号**。
+- 故 SO(3) S 面输出须乘 `geo_channel_sign=[-1,+1,-1]` 才是 restoring；否则纯解析基线
+  在 roll/yaw 上反阻尼（发散），会毁掉从 model_2846 的 fine-tune。诊断报告原式
+  `e_ω=ω_body−ω_desired` 配 + 号亦为反阻尼，已改为 `ω_desired−ω_body`。
+
+**新增配置**
+- `workflows/configs/train_flip360_so3_p1.yaml`：`attitude_error_mode: so3`、
+  `action_lim_vec: [0.6, 0.6, 0.3, 1.0]`、`geo_zeta1/2: 1.0/0.5`、`geo_residual_scale: 0.5`，
+  镜像 F4 的 `mixed_sine_flip360` 参考 + JONSWAP 扰动，从 model_2846 fine-tune 150 iter。
+
+**验证**
+- `python3 -m py_compile easyuuv_env.py` 通过。
+- `/tmp/so3_math_verify.py`（standalone，复刻精确张量运算）：
+  (1) 200 个随机 goal 上解析基线全部 restoring（τ·e_R>0）；
+  (2) 错误符号 `[1,1,1]` → 152/200 反阻尼，证明符号向量必要；
+  (3) ω_d 有限差分正确（0.5 rad/s goal 自旋 → e_omega=[0,0,0.5]）；
+  (4) 首步 ω_d≈0。
+- 零行为变更：默认 `attitude_error_mode="euler"` 时 so3 分支不执行，
+  `_so3_attitude_error`/`_geo_channel_sign`/`_goal_prev` 均不被消费，
+  `action_lim_vec` 默认值 = 旧硬编码，故 model_2846 复现不受影响。
+
+**训练命令（待运行，Phase 1 验证用）**
+```bash
+bash custom_workflows/run_with_isaac_env.sh workflows/train_meta.py \
+  --task EasyUUV-Direct-Parametric-v1 --num_envs 512 \
+  --meta_stage 0 --resume True --resume_load_optimizer False \
+  --load_run 2026-06-29_23-50-50_flip360_curric_b_full_pi_stage0 \
+  --checkpoint model_2846.pt \
+  --workflow_config workflows/configs/train_flip360_so3_p1.yaml \
+  --headless
+```
+验收：flip360 base/asym 低于 model_2846（2.0701/3.6606）且 ordinary base/asym 不退化。
+
+**训练与双目标 eval 结果（Phase 1，未胜出）**
+- 训练已完成：run `2026-07-01_20-15-47_flip360_so3_p1_stage0`，150 iter（2846→2995），
+  exit 0，checkpoints model_2850/2900/2950/2995。`log_mse` 全程落在 F3/F4 同构的 12–40
+  混沌非收敛区间（起点 iter 2846=6.46 反而最优，此后再未回落）。
+- 修复：运行首次崩溃 `AttributeError: 'EasyUUVEnv' object has no attribute
+  '_geo_channel_sign'`——init 块（`self._geo_channel_sign`）又一次未落盘（编辑器缓存 vs 磁盘
+  分叉），重新按 `self.action_lim` 锚点插入 easyuuv_env.py line 388-392，grep 裸磁盘 +
+  py_compile 验证后重跑。
+- 新增 SO(3)-mode eval 配置（控制律参数必须与训练一致，否则 policy 残差与控制律不匹配）：
+  `workflows/configs/pressure_flip360_medium_so3.yaml`、`matrix_wave_medium_so3.yaml`；
+  驱动脚本 `workflows/run_so3_p1_eval.sh`（沿用 F3/F4 off_clean 协议：total_steps=1500,
+  use_stdw=False, seed=0）。
+- 四 checkpoint × 双目标 eval（final_mse，baseline model_2846 括注）：
+
+  | ckpt (train log_mse) | flip360 base | flip360 asym | ordinary base | ordinary asym |
+  |---|---:|---:|---:|---:|
+  | model_2846 (baseline) | 2.0701 | 3.6606 | 0.2229 | 0.2266 |
+  | model_2850 (15.16) | 3.9158 | 4.7203 | 0.4815 | 0.5739 |
+  | model_2900 (23.15) | 6.5130 | 6.7913 | 0.4986 | 0.5559 |
+  | model_2950 (17.11) | 16.2042 | 11.8111 | 0.4983 | 0.5626 |
+  | model_2995 (30.51) | 5.9106 | 3.0318 | 0.4664 | 0.5523 |
+
+- **结论：Phase 1 未胜出，保留 model_2846 为最佳。** 每个 checkpoint 的 flip360 base 均劣于
+  2.07、两项 ordinary 均退化到 ~0.5（约 2×），仅 model_2995 的 flip360 asym（3.03<3.66）单点
+  改善，不构成占优。ordinary 退化说明 so3 控制律路径未能干净地涵盖旧 euler 行为。训练 log_mse
+  落入 F3/F4 混沌区间的警示与 eval 结论一致。
+- 下一步待用户拍板（用户既定优先级）：调 action_lim / geo_zeta / residual_scale 重训；或
+  扩 18 维；或开 Phase 2（解析前馈 τ_ff + 伪逆分配器 B†）。
+
+**契约**
+- C1–C5 主命令契约不改。Phase 2（解析前馈 τ_ff + 伪逆分配器 B†）为可选，未实施。
+
+---
+
+## 2026-06-30 — Flip360 F4 难区间容差整形 + 物理力矩边界判定（未胜出，确认架构边界）
+
+**新增**
+- `easyuuv_env.py`：F4 难区间（接近倒置）姿态跟踪容差整形。新增 cfg 字段
+  `flip_tol_relax`（默认 0.0，零行为变更）、`flip_tol_band_lo`（120°）、`flip_tol_band_hi`（180°）；
+  `_get_rewards` 内当 goal 倾角进入难区间时用 smoothstep 放宽 `rew_ang` 高斯宽度
+  （÷(1+relax·smooth)），只影响训练 reward，不影响 eval MSE 指标。
+- `workflows/configs/train_flip360_f4_tolshape.yaml`：从 `model_2846` fine-tune，
+  `flip_tol_relax: 2.0`，150 iter，lr 8e-5。
+- `workflows/analyze_flip360_torque_budget.py`：物理力矩边界定量分析工具（可复现），
+  对比逐轴控制力矩预算 vs 倒置区浮力回正力矩，回答“是否物理无解”。
+
+**实验结果（双目标 eval, total_steps=1500, use_stdw=False, seed0, freq0.05）**
+- F4 model_2850（训练 MSE 最低 ckpt）：flip360 base 2.0520 / asym 3.6747；
+  ordinary base 0.2229 / asym 0.2268。
+- 对比 `model_2846`：flip360 base 2.0701 / asym 3.6606；ordinary base 0.2229 / asym 0.2266。
+- **四项全面持平，无胜出无遗忘。** 训练 `log_mse` 段初从 ~6.1 立即脱离、全程在 14–42
+  混沌区间震荡、再未回到 6.1，与 F3 完全同构 —— 倒置区训练不收敛对 reward 容差整形不敏感。
+
+**物理力矩边界判定（`analyze_flip360_torque_budget.py`）**
+- F_buoy ≈ 222.49 N；倒置区浮力回正力矩最坏值：base offset(z=0.01) ≈ 2.22 Nm，
+  asymmetric offset(xy=0.05) ≈ 15.89 Nm。
+- 执行器硬上限（PWM=1.0）：roll ≈ 114.55 Nm、pitch ≈ 70.37 Nm —— 超 asym 最坏回正约 4–7×，
+  故满 ±π 后空翻**非严格物理无解**。
+- 但名义工作点（S 面 action_lim=0.15, a≈1）：roll ≈ 16.97 Nm、pitch ≈ 10.43 Nm；
+  其中 **pitch 10.43 Nm < asym 最坏回正 15.89 Nm**，克服回正须把动作压进 sigmoid 饱和尾部（≈bang-bang）。
+- **主导边界 = 倒置区不稳定平衡 + 欧拉轴控制奇异 + 名义工作点可学习带宽不足**，
+  三者不可由 reward 整形 / 课程移除。`model_2846` 已逼近该架构上限。
+
+**文档**
+- `REPORT_flip360_training_20260628.md` 新增第 6 节「F4 难区间容差整形 + 物理边界判定」。
+- `PLAN_stdw_hard_constraints_20260628.md` Section 12 Step F4 记录执行/结果/物理边界判定与执行顺序更新。
+- `.results/flip360_freq_sweep_analysis.md` 末尾追加「物理力矩边界判定」节。
+
+**契约**
+- C1-C5 主命令契约不改。
+
+---
+
+## 2026-06-30 — Flip360 F3 平滑幅度爬坡课程（未胜出，保留 model_2846）
+
+**新增**
+- F3 三段课程配置：`train_flip360_f3_s1_halfpi.yaml`（±π/2, flip_prob0.3, lr1e-4）、
+  `train_flip360_f3_s2_3qpi.yaml`（±3π/4, 0.4, 9e-5）、`train_flip360_f3_s3_fullpi.yaml`（±π, 0.5, 8e-5）。
+- 三段从 A3 `model_2398` 顺序 fine-tune（`--meta_stage 0 --resume_load_optimizer False`），
+  run 目录 `2026-06-30_22-11-54/22-14-39/22-19-46_flip360_f3_s{1,2,3}_*_stage0`。
+
+**实验结果（双目标 eval, total_steps1500, use_stdw=False, seed0, freq0.05）**
+- F3 model_2755（S3 末段）：flip360 base 3.2019 / asym 4.0127；ordinary base 0.2246 / asym 0.2755。
+- F3 model_2650（S3 训练 MSE 最低 23.27）：flip360 base 3.1214 / asym 3.5536。
+- 对比 curric `model_2846`：flip360 base 2.0701 / asym 3.6606。
+- **结论：F3 未超过 model_2846，保留 2846 为最佳。** 根因：S3 进入满 ±π 后训练 `log_mse`
+  从 ~6 爆到 20–85 混沌区间且全程不收敛，瓶颈在满倒置区训练不收敛（与 F1/F2 角度极限一致），
+  而非课程跳变幅度。model_2755 另有 ordinary asym 轻微遗忘。
+
+**文档**
+- `REPORT_flip360_training_20260628.md` 新增第 5 节「F3 结果」。
+- `PLAN_stdw_hard_constraints_20260628.md` Section 12 记录 F3 执行/结果与执行顺序更新；
+  下一步建议转向 F4（不放慢 + 难区间容差整形），等待用户拍板。
+
+**契约**
+- C1-C5 主命令契约不改。
+
+---
+
+## 2026-06-30 — Flip360 物理极限取证（F1 keep + F2 速度扫描）与报告中文化
+
+**新增**
+- `workflows/analyze_flip360_limits.py`：读取逐步 `stdw_output_*.csv`，按 |参考角| 与
+  |参考角速度| 分箱输出姿态误差、误差–角速度相关、`control_effort` 近饱和占比，并给出
+  `RATE-LIMITED` / `ANGLE-LIMITED` 自动判据。
+- keep / 速度扫描配置：`pressure_flip360_keep_slow.yaml`（freq 0.005）、
+  `pressure_flip360_freq0p025.yaml`、`pressure_flip360_freq0p1.yaml`。
+
+**实验结果（model_2846，flip360，只改 ref_sine_freq）**
+- RMSE 随参考变快单调下降：keep(0.005) base 1.742 → 0.025 1.001 → 0.05 0.915 → 0.1 0.792。
+- 准静态 keep 下 base 推力近饱和步占比 15.2%（其余频率 <0.3%）。
+- 判定为**驻留时间惩罚型角度极限**（非 rate-limited）：难区间（接近倒置）浮力回正力矩持续反向，
+  驻留越久越饱和。**“放慢参考”假设被数据否定**。
+- 分析产物：`.results/flip360_keep_analysis.md`、`.results/flip360_freq_sweep_analysis.md`。
+
+**文档**
+- `REPORT_flip360_training_20260628.md` 全文中文化，新增「课程现状 / 更平滑训练流程 /
+  物理极限分析（含脚本）/ 下一步建议」，并按 F1/F2 结论更新第 4 节。
+- `PLAN_stdw_hard_constraints_20260628.md` Section 12 记录 F1/F2 取证结果与执行顺序更新。
+
+**契约**
+- C1-C5 主命令契约不改。
+
+---
+
+## 2026-06-29 — Flip360 连续参考修复与幅度课程调优
+
+**修复**
+- `easyuuv_env._update_reference`：`flip360_sine` 此前只在 reset 设一次目标、控制步内不推进，
+  实为“静态大姿态保持”。现每步推进 roll/pitch 参考；Round 1 `model_2550` 旧数据作废。
+
+**新增**
+- `easyuuv_env.py`：`reference_mode=mixed_sine_flip360`（按 `ref_mix_flip_prob` 抽 flip / ordinary sine）
+  及 `ref_mix_*` cfg 字段。
+- `workflows/train_meta.py`：`--meta_stage 0` fine-tune 模式（不做梯度隔离 / 不覆盖 env）、
+  `--resume_load_optimizer`、`--ref_mix_*` 透传。
+- `workflows/sweep_stdw_safety_pressure.py`：窄 profile `flip360_only` / `ordinary_only`。
+- 课程配置：`train_flip360_curric_a.yaml`（±π/2）、`train_flip360_curric_b.yaml`（±π）、
+  `train_flip360_mixed_replay.yaml`。
+
+**实验结果**
+- 幅度课程（A ±π/2 → B ±π，均混 40% ordinary）产出 `model_2846`：连续 flip360 base
+  `2.8675 -> 2.0701`、asym `5.5360 -> 3.6606`，且 ordinary medium 无遗忘
+  （base `0.2257 -> 0.2229`，asym `0.2263 -> 0.2266`）。首个 Pareto 占优 A3 的 checkpoint。
+
+---
+
+## 2026-06-28 — STDW 安全压测入口与 360 度参考轨迹
+
+**新增**
+- `easyuuv_stdw_wrapper.py` 新增 Lyapunov gate mode：`sample_mask`、`strict_sample_mask`、
+  `guarded_drift`，并输出 `stdw_dV`、滚动 pass rate、safety block 等诊断字段。
+- `workflows/play_stdw_adapt.py` 新增 `--lyapunov_gate_mode`、margin/window/pass-rate、
+  `--lyapunov_guard_action`，可在安全压测中跳过慢环、冻结 drift 或将 drift 退回 0。
+- `easyuuv_env.py` / `workflows/train_meta.py` 新增 `reference_mode=flip360_sine`，用于
+  roll/pitch ±π 连续后空翻评估与后续训练入口。
+- `workflows/configs/pressure_flip360_medium_full.yaml` 与
+  `workflows/sweep_stdw_safety_pressure.py`：小而硬专项矩阵，覆盖 asymmetric Lyapunov
+  门控、1% 控制器 mismatch、360 度 eval，并强制关闭 OPR/router/probe。
+
+**契约**
+- C1-C5 主命令契约不改；`COMMAND_CONTRACT.md` 只新增 optional safety pressure tests。
+
+**实验结果**
+- 已完成 32-cell `small_hard` 正式矩阵：
+  `.results/stdw_safety_pressure_20260628_221237/`。
+- 结论见 `docs/engineering/REPORT_stdw_safety_pressure_20260628.md`：默认 STDW 在
+  `asymmetric + OPR off` 下比 clean off 差约 +139% 到 +141%；`strict_sample_mask`
+  不修复；`guarded_drift + zero_drift` 可回到 clean-off 水平。360 度后空翻 eval
+  当前失败，应进入训练课程设计。
+- 新增专项修复上下文：`docs/engineering/PLAN_stdw_hard_constraints_20260628.md`，
+  固定硬约束设计空间与后续 step-by-step 路线：先修 `pass_vs_off` 容差，再做
+  batch-level update acceptance / rollback，最后再处理 pseudo-action 通道门控与 360 训练课程。
+- OPR/domain-transfer 线索已记录并保留；当前切换到 flip360 训练课程。第一轮使用
+  `flip360_ft200_from_a3_stage1` 短训验证链路，再用 flip360 eval 对照 A3 stage2 baseline。
+- 新增 `docs/engineering/REPORT_flip360_training_20260628.md`。`model_2550.pt` 是本轮
+  最佳 flip360 checkpoint：base `3.366683 -> 2.237671`，asymmetric `5.895537 -> 2.184740`；
+  但普通 medium/asymmetric 从 `0.226305` 劣化到 `0.286082`，需要 mixed curriculum /
+  two-objective early stopping。
+
+---
+
+## 2026-06-28 — 命令契约与接手记忆收敛到 A3 stage2
+
+**文档收敛**
+- `docs/guide/COMMAND_CONTRACT.md` 更新为当前可执行契约：Isaac 相关命令统一使用
+  `bash custom_workflows/run_with_isaac_env.sh <script.py> ...`，并以 A3 stage2
+  `model_2398.pt` 作为主线复现 ckpt。
+- `docs/guide/AGENT_HANDOFF.md` 的接手记忆从 2026-06-07 试运行 ckpt 更新到
+  2026-06-08 A3 stage1/stage2 主线 ckpt，并修正 guide/principles 文档路径。
+- `README.md` 的命令摘要同步为当前 launcher 与 `model_2398.pt` 路径，详细命令仍以
+  `COMMAND_CONTRACT.md` 为准。
+- `docs/principles/RESEARCH_ANALYSIS.md` 的复现命令从旧 `--policy/--output_dir/--run_dir`
+  口径更新为当前 `--policy_path/--out_root/--matrix_dir`。
+
+**核对来源**
+- 对齐 `docs/engineering/REPORT_full_matrix_20260608_a3_stage2.md` 与
+  `docs/engineering/控制器稳定调节记录.md` §7.6-7.7。
+
+---
+
 ## 2026-06-24 — 干净环境 Fossen 6-DOF 部署链路冒烟
 
 **新增**

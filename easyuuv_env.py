@@ -48,7 +48,15 @@ import omni.isaac.lab.utils.math as math_utils
 ##
 from omni.isaac.lab.utils.math import quat_apply, quat_conjugate
 from .rigid_body_hydrodynamics import HydrodynamicForceModels
+from .boundary_effects import BoundaryEffectModels
 from .thruster_dynamics import DynamicsFirstOrder, ConversionFunctionBasic, get_thruster_com_and_orientations
+from .thrust_allocation import (
+    ThrusterLayout,
+    build_wrench_matrix,
+    dof_weight_vector,
+    control_channels_to_wrench,
+    allocate as allocate_thrust,
+)
 from .wave_disturbance_manager import JonswapWaveDisturbanceManager
 
 class EasyUUVEnvWindow(BaseEnvWindow):
@@ -101,15 +109,31 @@ class EasyUUVEnvCfg(DirectRLEnvCfg):
     goal_dims = 4
     eval_mode = False
 
+    # === 下沉-then-flip360 近边界协议（opt-in，默认关=零行为变更，见 EMBODIMENT_ZOO §4）===
+    # 所有 embodiment（含 base）先下沉+保持竖直（阶段 1），再 flip360（阶段 2），深度不触水面。
+    # 安全关系式：submerge_depth < z_surface_guard − vehicle_height/2 − surface_margin（默认 <2.7）。
+    submerge_phase_enable = False   # 开启 episode 内两相位调度
+    submerge_depth = 1.5            # 阶段 1 目标下沉深度（世界 z，越小越深；经 spawn starting_depth 实现）
+    submerge_hold_steps = 0         # 阶段 1 保持竖直的步数（episode_length_buf < 此值时锁竖直）
+    surface_guard_enable = False    # 开启破面守卫
+    surface_margin = 0.15           # 破面判据裕度
+    z_surface_guard = 3.0           # 破面守卫的世界 Z 水面（与 boundary_z_surface 对齐）
+
     # === 参考轨迹（reference）生成 ===
     # "step"       : 旧行为，每个 episode 重置时给一个随机姿态硬阶跃（用于复现/基线）。
     # "sine_sweep" : 每轴用低频正弦平滑生成连续 roll/pitch/yaw 目标（depth 固定），
     #                曲线平滑无硬跳变，便于评估稳态跟踪与超调抑制。
+    # "flip360_sine": roll/pitch 使用 ±π 连续正弦参考，用于 360 度后空翻压测。
+    # "mixed_sine_flip360": 每个 env 在 ordinary sine 与 flip360 之间抽样，用于防遗忘调优。
     reference_mode = "step"
     # sine_sweep 逐轴幅度 (rad)：[roll, pitch, yaw]；课程式从低幅起步逐步上调。
     ref_sine_amp = [0.3, 0.3, 0.3]
     # sine_sweep 逐轴频率 (Hz)：[roll, pitch, yaw]；不同频率避免三轴同相。
     ref_sine_freq = [0.10, 0.13, 0.07]
+    # mixed_sine_flip360 中抽到 flip360 子任务的 env 比例；剩余 env 使用 ref_mix_sine_*。
+    ref_mix_flip_prob = 0.5
+    ref_mix_sine_amp = [0.35, 0.35, 0.35]
+    ref_mix_sine_freq = [0.18, 0.22, 0.15]
 
     class disturbance_cfg:
         mode = "none"
@@ -141,6 +165,16 @@ class EasyUUVEnvCfg(DirectRLEnvCfg):
     # 阻尼项（抑制超调/振荡）：默认 0 保持旧行为，课程式从极低幅度起步逐步上调。
     rew_scale_action_rate = 0.0   # 惩罚相邻动作差 ‖a_t - a_{t-1}‖，抑制控制抖动
     rew_scale_action_jerk = 0.0   # 惩罚动作二阶差（jerk），专门压制高频震荡
+
+    # F4：难区间（接近倒置）姿态跟踪容差整形。默认关闭（relax=0）保持旧行为。
+    # 当 goal 相对竖直的倾角进入 [band_lo, band_hi] 时，按 smoothstep 放宽 rew_ang
+    # 的高斯宽度（等效降低该区误差惩罚斜率），避免始终在线的姿态项在物理不可达/不
+    # 稳定的倒置目标上持续扣分、污染易控区策略。band 单位 rad（goal 倾角，0=正立，
+    # pi=完全倒置）。物理依据：倒置区为浮力回正力矩的不稳定平衡，asym 机型 pitch 轴
+    # 控制力矩预算 < 最坏回正力矩，部分倒置姿态静态不可达。
+    flip_tol_relax = 0.0
+    flip_tol_band_lo = 2.094395    # 120 deg
+    flip_tol_band_hi = 3.1415926   # 180 deg
 
     # dynamics
     com_to_cob_offset = [0.0, 0.0, 0.01] # in meters, add this (xyz) to COM to get COB location
@@ -189,6 +223,49 @@ class EasyUUVEnvCfg(DirectRLEnvCfg):
     cascade_control = True # True: PID/S-surface cascade, False: RL direct PWM duty cycle
     self_adapt = False # True: enable A-S-Surface adaptation term when control_method == 'Ssurface'
     gain_update_targets = ["zeta1"] # configurable online gain targets; S-surface commonly uses zeta1/zeta2
+
+    # === SO(3) 流形 S-Surface 升级（Phase 1，默认 euler = 旧行为，零行为变更）===
+    # "euler": 旧逐轴解耦（policy 4 通道直接进 sigmoid）；"so3": 在 SO(3) 流形上算
+    # e_R（四元数误差虚部）与 e_ω（body 角速度 − 参考角速度），三轴向量化 S 面。
+    attitude_error_mode = "euler"
+    # 取代硬编码的 action_lim（line ~369），改为可由 YAML 设置；so3 模式抬高 roll/pitch 解封力矩。
+    action_lim_vec = [0.15, 0.15, 0.3, 1.0]
+    geo_zeta1 = 1.0          # e_R 增益 ζ1（进 sigmoid）
+    geo_zeta2 = 0.5          # e_ω 增益 ζ2（进 sigmoid）
+    geo_residual_scale = 0.0 # RL 残差对 so3 S 面输入的调制（0=纯解析；>0=残差 RL，保 12 维 obs）
+    # 固定手工分配矩阵 (line ~1610) 对 roll/yaw 通道的 PID_value→body torque 是反号的：
+    # 数值标定（单位命令的净 body 力矩）：roll τx=-0.84、pitch τy=+0.516、yaw τz=-0.56。
+    # e_R[i]>0 表示需绕 body 轴 i 施加 +τ，故须乘该符号向量把解析 S 面输出转成 restoring。
+    # 若不加，纯解析基线在 roll/yaw 上是反阻尼（发散），会毁掉从 model_2846 的 fine-tune。
+    geo_channel_sign = [-1.0, 1.0, -1.0]
+
+    # === M3: controller mismatch injection (plug-and-play, default = pid_gain 现状) ===
+    # 旧 --pid_multipliers 路径属于 pid_gain 模式（缩 ζ 增益），已知会被 sigmoid 饱和吞掉，
+    # 故 STDW 相对改善恒定在 ~67%。新增三种作用在「对输出真正敏感」参数上的失配靶点：
+    #   - actuator_scale  : 直接乘 motorValue→thrust 线性段（绕开 sigmoid 饱和）。
+    #   - s_surface_struct: 扰动 s_ratio 斜率与加性项权威（改变控制律结构）。
+    #   - allocation_skew : 扰动 roll/pitch/yaw/depth 通道分配权重（推进器安装偏差）。
+    # 默认 pid_gain 时所有 mismatch 缩放为恒等，零行为变更。
+    ctrl_mismatch_mode = "pid_gain"
+
+    # === M4: near-boundary effects (plug-and-play, default = off 完全旁路) ===
+    # 见 boundary_effects.BoundaryEffectModels 与 ref/近边界效应.md。
+    #   off                : 现状，无任何边界力（默认，零行为变更）。
+    #   residual_buoyancy  : 微正浮力配平偏差 ΔB=frac·mg（机制一）。
+    #   free_surface       : 自由液面分段浮力/阻尼 ×s(t) + 推进器吸气（机制二）。
+    #   ground_effect      : 近底吸力 F=F_nom·(D/h)^γ（机制三）。
+    #   nonlinear_restoring: 显式 COG/COB 偏置恢复力矩，强化 180° 失稳（机制一.2）。
+    #   full               : 以上全部叠加。
+    boundary_effect_mode = "off"
+    boundary_residual_buoyancy_frac = 0.015  # +上浮，相对体重 m·g 的比例
+    boundary_z_surface = 3.0                 # 世界 Z 水面高度
+    boundary_z_bottom = 0.0                  # 世界 Z 池底高度
+    boundary_vehicle_height = 0.3            # UUV 垂直高度 H
+    boundary_ground_effect_coeff = 0.15      # F_nom = coeff·mg
+    boundary_ground_effect_gamma = 2.0       # 近地效应指数 γ
+    boundary_ground_effect_threshold = 0.5   # 触发近地效应的离底阈值 (m)
+    boundary_r_cog = [0.0, 0.0, 0.0]         # B5 显式 COG body 偏置
+    boundary_r_cob = [0.0, 0.0, 0.0]         # B5 显式 COB body 偏置
 
     # === Parametric meta-control (8-dim action) ===
     # 主开关；True 时必须配合 num_actions=8 的子 cfg / 任务 ID 使用。
@@ -280,6 +357,96 @@ class EasyUUVEnvCfg(DirectRLEnvCfg):
             "dyn_time_constant": 0.05,
             "drag_multiplier": 1.0,
         },
+        # === 多 embodiment 扩展（config 驱动 B⁺，opt-in，见 docs/guide/EMBODIMENT_ZOO.md）===
+        # 每项在既有键之外声明可选键 num_thrusters/volume/action_lim_vec/thrust_allocation，
+        # 触发 apply_embodiment_config 的 config 分配路径（_use_config_alloc=True）。
+        # thrust_allocation.layout_specs 行 = [x, y, z, roll, pitch, yaw]（com->thruster 偏移 + rpy 朝向）。
+        # 垂直推进器 pitch=-1.5708 (-90°) 承 roll/pitch/depth；水平推进器承 yaw。
+        # ρ_body = mass/volume ≈ 990 < 997（水），微正浮力，满足近边界效应假设（D6）。
+        "uuv6": {  # 全驱 6 推（4 垂直 + 2 水平纯 yaw 力偶），三控制轴正交
+            "mass": 29.70,
+            "inertia_tensors": [0.55, 1.45, 1.78],
+            "com_to_cob_offset": [0.0, 0.0, 0.01],
+            "dyn_time_constant": 0.05,
+            "drag_multiplier": 1.0,
+            "num_thrusters": 6,
+            "volume": 0.030000,
+            "action_lim_vec": [0.6, 0.6, 0.3, 1.0],
+            "thrust_allocation": {
+                "layout_specs": [
+                    [0.129, 0.21, 0.03, 0.0, -1.5708, 0.0],    # 0 front_left_vertical
+                    [0.129, -0.21, 0.03, 0.0, -1.5708, 0.0],   # 1 front_right_vertical
+                    [-0.129, 0.21, 0.03, 0.0, -1.5708, 0.0],   # 2 rear_left_vertical
+                    [-0.129, -0.21, 0.03, 0.0, -1.5708, 0.0],  # 3 rear_right_vertical
+                    [0.0, 0.16125, -0.02, 0.0, 0.0, 0.0],      # 4 left_horizontal (+x)
+                    [0.0, -0.16125, -0.02, 0.0, 0.0, 0.0],     # 5 right_horizontal (+x) -> 差分成 yaw 力偶
+                ],
+                "mode": "pinv",
+                "controllable_dofs": ["heave", "roll", "pitch", "yaw"],
+            },
+        },
+        "uuv4": {  # 欠驱动 4 推（仅 4 垂直），舍弃 yaw，只满足 roll/pitch/depth
+            "mass": 21.78,
+            "inertia_tensors": [0.36, 0.94, 1.15],
+            "com_to_cob_offset": [0.0, 0.0, 0.01],
+            "dyn_time_constant": 0.05,
+            "drag_multiplier": 1.0,
+            "num_thrusters": 4,
+            "volume": 0.022000,
+            "action_lim_vec": [0.6, 0.6, 0.3, 1.0],
+            "thrust_allocation": {
+                "layout_specs": [
+                    [0.129, 0.21, 0.03, 0.0, -1.5708, 0.0],
+                    [0.129, -0.21, 0.03, 0.0, -1.5708, 0.0],
+                    [-0.129, 0.21, 0.03, 0.0, -1.5708, 0.0],
+                    [-0.129, -0.21, 0.03, 0.0, -1.5708, 0.0],
+                ],
+                "mode": "wls",
+                "controllable_dofs": ["heave", "roll", "pitch"],  # 屏蔽 yaw（Tz）
+            },
+        },
+        "uuv6_angled": {  # 全驱 6 推非正交：垂直推进器带 ±8° roll 倾角、水平带 10° pitch 倾角
+            "mass": 31.68,
+            "inertia_tensors": [0.60, 1.55, 1.90],
+            "com_to_cob_offset": [0.0, 0.0, 0.01],
+            "dyn_time_constant": 0.05,
+            "drag_multiplier": 1.0,
+            "num_thrusters": 6,
+            "volume": 0.032000,
+            "action_lim_vec": [0.6, 0.6, 0.3, 1.0],
+            "thrust_allocation": {
+                "layout_specs": [
+                    [0.129, 0.21, 0.03, 0.139626, -1.5708, 0.0],
+                    [0.129, -0.21, 0.03, -0.139626, -1.5708, 0.0],
+                    [-0.129, 0.21, 0.03, 0.139626, -1.5708, 0.0],
+                    [-0.129, -0.21, 0.03, -0.139626, -1.5708, 0.0],
+                    [0.0, 0.16125, -0.02, 0.0, 0.174533, 0.0],
+                    [0.0, -0.16125, -0.02, 0.0, 0.174533, 0.0],
+                ],
+                "mode": "pinv",
+                "controllable_dofs": ["heave", "roll", "pitch", "yaw"],
+            },
+        },
+        "uuv4_angled": {  # 欠驱动 4 推非正交：垂直推进器带 ±8° roll 倾角，舍弃 yaw
+            "mass": 23.76,
+            "inertia_tensors": [0.40, 1.02, 1.25],
+            "com_to_cob_offset": [0.0, 0.0, 0.01],
+            "dyn_time_constant": 0.05,
+            "drag_multiplier": 1.0,
+            "num_thrusters": 4,
+            "volume": 0.024000,
+            "action_lim_vec": [0.6, 0.6, 0.3, 1.0],
+            "thrust_allocation": {
+                "layout_specs": [
+                    [0.129, 0.21, 0.03, 0.139626, -1.5708, 0.0],
+                    [0.129, -0.21, 0.03, -0.139626, -1.5708, 0.0],
+                    [-0.129, 0.21, 0.03, 0.139626, -1.5708, 0.0],
+                    [-0.129, -0.21, 0.03, -0.139626, -1.5708, 0.0],
+                ],
+                "mode": "wls",
+                "controllable_dofs": ["heave", "roll", "pitch"],  # 屏蔽 yaw（Tz）
+            },
+        },
     }
 
 
@@ -305,6 +472,10 @@ class EasyUUVEnv(DirectRLEnv):
         self._step_count = 0
         # sine_sweep 参考：逐 env 逐轴随机相位，使每个 episode 的连续目标各不相同。
         self._ref_phase = torch.zeros(self.num_envs, 3, device=self.device)
+        self._ref_is_flip = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        # SO(3) 控制：上一步参考四元数，用于有限差分得到参考角速度 ω_d（避免欧拉率奇异）。
+        self._goal_prev = torch.zeros(self.num_envs, 4, device=self.device)
+        self._goal_prev[:, 0] = 1.0  # 单位四元数初值
         # 动作平滑/jerk 阻尼用：上一步与上上步动作（reward 项消费）。
         self._prev_action = torch.zeros(self.num_envs, self.cfg.num_actions, device=self.device)
         self._prev_prev_action = torch.zeros(self.num_envs, self.cfg.num_actions, device=self.device)
@@ -316,11 +487,24 @@ class EasyUUVEnv(DirectRLEnv):
         self.thruster_quats = self.thruster_quats.repeat(self.num_envs, 1).to(self.device)
         self._base_thruster_quats = self.thruster_quats.clone()
 
+        # 配置化推力分配（TAM）状态。默认走旧硬编码 8 推混合块（_use_config_alloc=False），
+        # 仅当 embodiment config 声明 thrust_allocation 时切到 config B⁺ 路径（apply_embodiment_config）。
+        self._num_thrusters = 8
+        self._use_config_alloc = False
+        self._alloc_B = None          # (6, N) 分配矩阵
+        self._alloc_mode = "pinv"     # "pinv" | "wls"
+        self._alloc_weight = None     # (6,) WLS 对角权重（欠驱动屏蔽不可控 DOF）
+
         # 新增：PID
         self.PID_args = torch.zeros(self.num_envs, 4, 3, device=self.device)
         self.old_actions = torch.zeros(self.num_envs, 4, device=self.device)
         self.actions_i = torch.zeros(self.num_envs, 4, device=self.device) # 积分项不使用
-        self.action_lim = torch.tensor([0.15, 0.15, 0.3, 1]).reshape(1, 4).to(self.device)
+        self.action_lim = torch.tensor(self.cfg.action_lim_vec, dtype=torch.float, device=self.device).reshape(1, 4)
+        # SO(3) S 面：固定分配矩阵对 roll/yaw 反号，乘 restoring 符号向量修正（数值标定 [-1,+1,-1]）。
+        self._geo_channel_sign = torch.tensor(
+            getattr(self.cfg, "geo_channel_sign", [-1.0, 1.0, -1.0]),
+            dtype=torch.float, device=self.device,
+        ).reshape(1, 3)
         # A1：S 面 D 项 EMA 低通状态。仅在 d_filter_tau > 0 时使用。
         self._actions_d_filt = torch.zeros(self.num_envs, 4, device=self.device)
         self._actions_d_filt_prev = torch.zeros(self.num_envs, 4, device=self.device)
@@ -383,6 +567,39 @@ class EasyUUVEnv(DirectRLEnv):
         self.fault_profile = "rate"
         self.fault_target_efficiency = 0.0
         self.fault_ramp_duration_s = 0.0
+
+        # === M3: controller mismatch persistent state (default = identity, 零行为变更) ===
+        # mode 决定失配靶点；缩放因子默认 1.0（恒等）。apply_ctrl_mismatch() 写入这些 buffer，
+        # _pid_control / _compute_dynamics 在对应 hook 处乘入。
+        self.ctrl_mismatch_mode = str(getattr(self.cfg, "ctrl_mismatch_mode", "pid_gain"))
+        # CM-B actuator_scale: 每推进器乘性失配（绕开 sigmoid 饱和，作用在 thrust 线性段）。
+        self._mismatch_actuator_scale = torch.ones((self.num_envs, 8), device=self.device)
+        # CM-C s_surface_struct: sigmoid 斜率与加性项权威缩放（标量）。
+        self._mismatch_s_ratio_scale = 1.0
+        self._mismatch_add_scale = 1.0
+        # CM-D allocation_skew: 4 控制通道 (roll/pitch/yaw/depth) 分配权重缩放。
+        self._mismatch_alloc_scale = torch.ones((self.num_envs, 4), device=self.device)
+
+        # === M4: near-boundary effects (plug-and-play, default = off 完全旁路) ===
+        # BoundaryEffectModels 仅返回加性 body-frame wrench 修正，在 _compute_dynamics
+        # 合成口加入；推进器吸气返回每推进器 efficiency 乘子。默认 off → any_enabled=False
+        # → 全部旁路，零行为变更。set_boundary_effect_mode() 可运行期切换。
+        self.boundary_models = BoundaryEffectModels(
+            num_envs=self.num_envs,
+            device=self.device,
+            residual_buoyancy_frac=float(getattr(self.cfg, "boundary_residual_buoyancy_frac", 0.015)),
+            z_surface=float(getattr(self.cfg, "boundary_z_surface", 3.0)),
+            z_bottom=float(getattr(self.cfg, "boundary_z_bottom", 0.0)),
+            vehicle_height=float(getattr(self.cfg, "boundary_vehicle_height", 0.3)),
+            ground_effect_coeff=float(getattr(self.cfg, "boundary_ground_effect_coeff", 0.15)),
+            ground_effect_gamma=float(getattr(self.cfg, "boundary_ground_effect_gamma", 2.0)),
+            ground_effect_threshold=float(getattr(self.cfg, "boundary_ground_effect_threshold", 0.5)),
+            r_cog=tuple(getattr(self.cfg, "boundary_r_cog", [0.0, 0.0, 0.0])),
+            r_cob=tuple(getattr(self.cfg, "boundary_r_cob", [0.0, 0.0, 0.0])),
+        )
+        self.boundary_models.apply_mode(str(getattr(self.cfg, "boundary_effect_mode", "off")))
+        self._last_boundary_info: dict = {}
+
         self.thruster_angle_shift_enabled = False
         self.thruster_angle_shift_thrusters = [4]
         self.thruster_angle_shift_rad = 0.0
@@ -639,6 +856,88 @@ class EasyUUVEnv(DirectRLEnv):
             param_idx = param_lookup[param_name]
             self.PID_args[target_envs, axis_idx, param_idx] *= float(multiplier)
 
+    def apply_ctrl_mismatch(self, spec: Mapping[str, object] | None, env_ids: Sequence[int] | None = None) -> None:
+        """M3: 安装非 pid_gain 失配靶点（plug-and-play，可拆装）。
+
+        Args:
+            spec: dict，至少含 ``mode`` ∈ {pid_gain, actuator_scale, s_surface_struct, allocation_skew}。
+                  其余字段按 mode 解释：
+                    actuator_scale : ``thrust_scale`` (float, 全推进器乘性) 或
+                                     ``thruster_scales`` (list[num_thrusters])。
+                    s_surface_struct: ``s_ratio_scale`` (float)、``add_scale`` (float)。
+                    allocation_skew : ``alloc_scale`` (list[4], roll/pitch/yaw/depth) 或
+                                      ``alloc_axis``+``alloc_value`` 单轴。
+            env_ids: 仅作用于这些 env；None = 全部。
+        本方法只写入持久 mismatch buffer，恒等默认不改变任何行为。pid_gain 模式为 no-op
+        （仍走既有 --pid_multipliers 路径）。
+        """
+        if not spec:
+            return
+        mode = str(spec.get("mode", "pid_gain"))
+        self.ctrl_mismatch_mode = mode
+        if env_ids is None:
+            target = slice(None)
+        else:
+            target = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
+
+        if mode == "pid_gain":
+            return  # 现状路径；增益缩放走 apply_pid_multipliers。
+
+        if mode == "actuator_scale":
+            if "thruster_scales" in spec:
+                scales = torch.as_tensor(
+                    spec["thruster_scales"], device=self.device, dtype=torch.float32
+                ).reshape(1, self._num_thrusters)
+                self._mismatch_actuator_scale[target] = scales
+            else:
+                s = float(spec.get("thrust_scale", 1.0))
+                self._mismatch_actuator_scale[target] = s
+        elif mode == "s_surface_struct":
+            self._mismatch_s_ratio_scale = float(spec.get("s_ratio_scale", 1.0))
+            self._mismatch_add_scale = float(spec.get("add_scale", 1.0))
+        elif mode == "allocation_skew":
+            if "alloc_scale" in spec:
+                vec = torch.as_tensor(
+                    spec["alloc_scale"], device=self.device, dtype=torch.float32
+                ).reshape(1, 4)
+                self._mismatch_alloc_scale[target] = vec
+            else:
+                axis_lookup = {"roll": 0, "pitch": 1, "yaw": 2, "depth": 3}
+                axis = str(spec.get("alloc_axis", "yaw"))
+                val = float(spec.get("alloc_value", 1.0))
+                if axis in axis_lookup:
+                    self._mismatch_alloc_scale[target, axis_lookup[axis]] = val
+        else:
+            print(f"[WARN] apply_ctrl_mismatch: unknown mode {mode!r}; ignored.")
+
+    def apply_boundary_effect(self, spec: Mapping[str, object] | str | None) -> None:
+        """M4: 配置近边界效应（plug-and-play，可拆装）。
+
+        Args:
+            spec: 字符串（直接当作 ``boundary_effect_mode`` 预设）或 dict：
+                  {"mode": "free_surface", "z_surface": 1.5, "residual_buoyancy_frac": 0.02,
+                   "r_cob": [0,0,0.02], ...}。dict 中除 ``mode`` 外的键按名覆盖
+                  BoundaryEffectModels 的同名字段，再应用 mode 预设的开关。
+        默认/未提供时保持 off，零行为变更。
+        """
+        if spec is None:
+            return
+        if isinstance(spec, str):
+            self.boundary_models.apply_mode(spec)
+            return
+        if not isinstance(spec, Mapping):
+            print(f"[WARN] apply_boundary_effect: unsupported spec {spec!r}; ignored.")
+            return
+        mode = str(spec.get("mode", "off"))
+        for key, val in spec.items():
+            if key == "mode":
+                continue
+            if hasattr(self.boundary_models, key):
+                setattr(self.boundary_models, key, val)
+            else:
+                print(f"[WARN] apply_boundary_effect: unknown field {key!r}; ignored.")
+        self.boundary_models.apply_mode(mode)
+
     def apply_embodiment_config(self, embodiment_type: str) -> None:
         """
         Apply a specific embodiment configuration to the environment.
@@ -669,22 +968,57 @@ class EasyUUVEnv(DirectRLEnv):
 
         # Apply dynamics time constant
         self.cfg.dyn_time_constant = config["dyn_time_constant"]
-        # Reinitialize thruster dynamics with new time constant
-        self.thruster_dynamics = DynamicsFirstOrder(self.num_envs, 8, self.cfg.dyn_time_constant, self.device)
+
+        # === 推进器几何 + 分配路径 ===
+        # config 声明 thrust_allocation -> config 驱动 B⁺ 路径（任意 N 推、支持非正交/欠驱动）；
+        # 否则 -> 旧硬编码 8 推混合块路径（base/asym/long_body/heavy_*，零行为变更 A4）。
+        alloc_cfg = config.get("thrust_allocation")
+        if alloc_cfg is not None:
+            layout = ThrusterLayout.from_specs(alloc_cfg["layout_specs"])
+            self._num_thrusters = layout.num_thrusters
+            self._use_config_alloc = True
+            self.thruster_com_offsets = layout.positions.unsqueeze(0).repeat(self.num_envs, 1, 1).to(self.device)
+            self.thruster_quats = layout.orientations.repeat(self.num_envs, 1).to(self.device)
+            self._base_thruster_quats = self.thruster_quats.clone()
+            self._alloc_B = build_wrench_matrix(layout).to(self.device)
+            self._alloc_mode = alloc_cfg.get("mode", "pinv")
+            self._alloc_weight = dof_weight_vector(alloc_cfg.get("controllable_dofs")).to(self.device)
+        else:
+            self._num_thrusters = 8
+            self._use_config_alloc = False
+            self._alloc_B = None
+            self._alloc_weight = None
+            # 旧几何重建路径（支持 long_body 的 thruster_com_offset_scale）。
+            base_com_offsets, base_quats = get_thruster_com_and_orientations(self.device)
+            if "thruster_com_offset_scale" in config:
+                scale = config["thruster_com_offset_scale"]
+                self.thruster_com_offsets = (base_com_offsets * scale).unsqueeze(0).repeat(self.num_envs, 1, 1).to(self.device)
+                # Note: thruster_quats remain unchanged
+            else:
+                self.thruster_com_offsets = base_com_offsets.unsqueeze(0).repeat(self.num_envs, 1, 1).to(self.device)
+
+        # Reinitialize thruster dynamics with new time constant + thruster count
+        self.thruster_dynamics = DynamicsFirstOrder(self.num_envs, self._num_thrusters, self.cfg.dyn_time_constant, self.device)
+
+        # 推进器数量变化时，重建按推进器广播的运行期 buffer（默认 8 推时 N==8 恒等，零行为变更）。
+        # 这两个 buffer 在 _compute_dynamics 里逐推进器乘 motorValues（shape N），必须与 N 对齐。
+        if self.thruster_efficiency_factors.shape[1] != self._num_thrusters:
+            self.thruster_efficiency_factors = torch.ones((self.num_envs, self._num_thrusters), device=self.device)
+        if self._mismatch_actuator_scale.shape[1] != self._num_thrusters:
+            self._mismatch_actuator_scale = torch.ones((self.num_envs, self._num_thrusters), device=self.device)
 
         # Apply drag multiplier for heavy-duty case
         self._drag_multiplier = config.get("drag_multiplier", 1.0)
 
-        # Apply thruster COM offset scaling for long-body case
-        if "thruster_com_offset_scale" in config:
-            scale = config["thruster_com_offset_scale"]
-            # Get original thruster COM offsets and scale them
-            base_com_offsets, base_quats = get_thruster_com_and_orientations(self.device)
-            self.thruster_com_offsets = (base_com_offsets * scale).unsqueeze(0).repeat(self.num_envs, 1, 1).to(self.device)
-            # Note: thruster_quats remain unchanged
-        else:
-            base_com_offsets, base_quats = get_thruster_com_and_orientations(self.device)
-            self.thruster_com_offsets = base_com_offsets.unsqueeze(0).repeat(self.num_envs, 1, 1).to(self.device)
+        # config 化 volume（ρ_body 差异化，微正浮力）。
+        if "volume" in config:
+            self.volumes = torch.full((self.num_envs, 1), config["volume"], device=self.device)
+
+        # config 化 action_lim（SO(3) 解封 roll/pitch）。
+        if "action_lim_vec" in config:
+            self.action_lim = torch.tensor(
+                config["action_lim_vec"], dtype=torch.float, device=self.device
+            ).reshape(1, 4)
 
         self._refresh_domain_randomization_defaults()
 
@@ -694,6 +1028,7 @@ class EasyUUVEnv(DirectRLEnv):
         print(f"  COM to COB offset: {config['com_to_cob_offset']}")
         print(f"  Dynamics time constant: {config['dyn_time_constant']}")
         print(f"  Drag multiplier: {self._drag_multiplier}")
+        print(f"  Thrusters: {self._num_thrusters}  (config_alloc={self._use_config_alloc}, mode={self._alloc_mode})")
 
     def _refresh_domain_randomization_defaults(self) -> None:
         """@dox _refresh_domain_randomization_defaults
@@ -945,8 +1280,8 @@ class EasyUUVEnv(DirectRLEnv):
         if self._tune_gains_enabled and self._actions.shape[1] >= 8:
             self._a_gain_buf[:] = self._actions[:, 4:8]
 
-        # sine_sweep 模式：每个控制步按 episode 内时间平滑推进参考目标。
-        if getattr(self.cfg, "reference_mode", "step") == "sine_sweep":
+        # 连续参考模式：每个控制步按 episode 内时间平滑推进参考目标。
+        if getattr(self.cfg, "reference_mode", "step") in {"sine_sweep", "flip360_sine", "mixed_sine_flip360"}:
             self._update_reference()
 
     def _apply_action(self) -> None:
@@ -1074,6 +1409,27 @@ class EasyUUVEnv(DirectRLEnv):
         ang_mse = math_utils.quat_error_magnitude(self._goal[:,:], self._robot.data.root_quat_w[:,:])
         self.log_MSE += torch.pow(ang_mse,2)
 
+        # F4：难区间（接近倒置）容差整形。在 goal 倾角进入 band 时放宽姿态项惩罚斜率，
+        # 避免始终在线的 rew_ang 对物理不可达/不稳定的倒置目标持续扣分而污染易控区。
+        # 等效做法：对该区 env 把 rew_ang 的高斯指数除以 (1 + relax*w)，w∈[0,1] 平滑过渡。
+        flip_relax = float(getattr(self.cfg, "flip_tol_relax", 0.0))
+        if flip_relax > 0.0:
+            # goal 倾角 = goal 体 z 轴与世界 z 轴夹角；用四元数把世界 +z 旋到 goal 体系，
+            # 取其 z 分量 = cos(tilt)。goal 存 (w,x,y,z) 顺序。
+            gq = self._goal[:, 0:4]
+            w, x, y, z = gq[:, 0], gq[:, 1], gq[:, 2], gq[:, 3]
+            # body_z 在世界系的 z 分量（旋转矩阵 R[2,2]）= 1 - 2(x^2 + y^2)
+            cos_tilt = 1.0 - 2.0 * (x * x + y * y)
+            tilt = torch.acos(torch.clamp(cos_tilt, -1.0, 1.0))
+            lo = float(getattr(self.cfg, "flip_tol_band_lo", 2.094395))
+            hi = float(getattr(self.cfg, "flip_tol_band_hi", math.pi))
+            u = torch.clamp((tilt - lo) / max(hi - lo, 1e-6), 0.0, 1.0)
+            smooth = u * u * (3.0 - 2.0 * u)  # smoothstep
+            relax_factor = 1.0 + flip_relax * smooth  # >=1，band 内放宽
+            base_ang = self.cfg.rew_scale_ang * torch.exp(-1.0 * ang_mse)
+            shaped_ang = self.cfg.rew_scale_ang * torch.exp(-1.0 * ang_mse / relax_factor)
+            total_reward = total_reward + (shaped_ang - base_ang)
+
         return total_reward
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1095,7 +1451,11 @@ class EasyUUVEnv(DirectRLEnv):
                 (torch.abs(self._robot.data.root_pos_w[:, 2] - self.cfg.starting_depth) > self.cfg.max_auv_z)
             )
         else:
-            out_of_bounds = torch.zeros(self.num_envs)
+            out_of_bounds = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+
+        if getattr(self.cfg, "surface_guard_enable", False):
+            breach = self._robot.data.root_pos_w[:, 2] > (self.cfg.z_surface_guard - self.cfg.surface_margin)
+            out_of_bounds = out_of_bounds.to(device=self.device, dtype=torch.bool) | breach
 
         return out_of_bounds, time_out
 
@@ -1173,18 +1533,27 @@ class EasyUUVEnv(DirectRLEnv):
 
     # OVERRIDE THIS FUNC TO CHANGE GOAL
     def _reset_goal(self, env_ids: Sequence[int]):
-        if getattr(self.cfg, "reference_mode", "step") == "sine_sweep":
+        if getattr(self.cfg, "reference_mode", "step") in {"sine_sweep", "flip360_sine", "mixed_sine_flip360"}:
             # 平滑正弦参考：每个 env 逐轴抽随机相位，episode 内目标由 _update_reference 连续生成。
             ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long) \
                 if not isinstance(env_ids, torch.Tensor) else env_ids
             self._ref_phase[ids] = math_utils.sample_uniform(
                 0.0, 2.0 * math.pi, (ids.numel(), 3), self.device
             )
+            if getattr(self.cfg, "reference_mode", "step") == "mixed_sine_flip360":
+                flip_prob = float(getattr(self.cfg, "ref_mix_flip_prob", 0.5))
+                self._ref_is_flip[ids] = torch.rand(ids.numel(), device=self.device) < flip_prob
+            else:
+                self._ref_is_flip[ids] = getattr(self.cfg, "reference_mode", "step") == "flip360_sine"
             self._update_reference(ids)
+            # 新 episode 首步令 ω_d=0：参考"上一步"对齐到刚生成的新目标。
+            self._goal_prev[ids] = self._goal[ids, 0:4].clone()
             return
 
         # Get random orientation (step 模式：每个 episode 一个随机姿态硬阶跃)
         self._goal[env_ids, 0:4] = math_utils.random_orientation(len(env_ids), device=self.device)
+        # step 模式 goal 恒定，令 _goal_prev = goal ⇒ ω_d = 0（SO(3) 模式不引入虚假参考角速度）。
+        self._goal_prev[env_ids] = self._goal[env_ids, 0:4].clone()
 
         # Get random yaw orientation with 0 pitch and roll
         # self._goal[env_ids,0:4] = math_utils.random_yaw_orientation(len(env_ids), device=self.device)
@@ -1196,8 +1565,9 @@ class EasyUUVEnv(DirectRLEnv):
         # self._goal[env_ids,0:4] = math_utils.quat_from_euler_xyz(rs, ps, ys)
 
     def _update_reference(self, env_ids: Sequence[int] | None = None):
-        """sine_sweep 模式下，按 episode 内时间为每个 env 生成平滑 roll/pitch/yaw 目标四元数。"""
-        if getattr(self.cfg, "reference_mode", "step") != "sine_sweep":
+        """按 episode 内时间为每个 env 生成连续 roll/pitch/yaw 目标四元数。"""
+        reference_mode = getattr(self.cfg, "reference_mode", "step")
+        if reference_mode not in {"sine_sweep", "flip360_sine", "mixed_sine_flip360"}:
             return
         if env_ids is None:
             ids = self._robot._ALL_INDICES
@@ -1205,11 +1575,61 @@ class EasyUUVEnv(DirectRLEnv):
             ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long) \
                 if not isinstance(env_ids, torch.Tensor) else env_ids
 
-        amp = torch.as_tensor(self.cfg.ref_sine_amp, device=self.device, dtype=torch.float32).reshape(1, 3)
-        freq = torch.as_tensor(self.cfg.ref_sine_freq, device=self.device, dtype=torch.float32).reshape(1, 3)
+        # SO(3) 控制：在覆盖 _goal 之前快照上一步参考，供有限差分求 ω_d。
+        self._goal_prev[ids] = self._goal[ids, 0:4].clone()
+        hold_mask = None
+        if getattr(self.cfg, "submerge_phase_enable", False):
+            hold_steps = int(getattr(self.cfg, "submerge_hold_steps", 0))
+            if hold_steps > 0:
+                hold_mask = self.episode_length_buf[ids] < hold_steps
+
+        if reference_mode == "flip360_sine":
+            amp_value = getattr(self.cfg, "ref_sine_amp", [math.pi, math.pi, 0.0])
+            freq_value = getattr(self.cfg, "ref_sine_freq", [0.05, 0.05, 0.0])
+        elif reference_mode == "mixed_sine_flip360":
+            flip_amp = torch.as_tensor(
+                getattr(self.cfg, "ref_sine_amp", [math.pi, math.pi, 0.0]),
+                device=self.device,
+                dtype=torch.float32,
+            ).reshape(1, 3)
+            flip_freq = torch.as_tensor(
+                getattr(self.cfg, "ref_sine_freq", [0.05, 0.05, 0.0]),
+                device=self.device,
+                dtype=torch.float32,
+            ).reshape(1, 3)
+            sine_amp = torch.as_tensor(
+                getattr(self.cfg, "ref_mix_sine_amp", self.cfg.ref_sine_amp),
+                device=self.device,
+                dtype=torch.float32,
+            ).reshape(1, 3)
+            sine_freq = torch.as_tensor(
+                getattr(self.cfg, "ref_mix_sine_freq", self.cfg.ref_sine_freq),
+                device=self.device,
+                dtype=torch.float32,
+            ).reshape(1, 3)
+            is_flip = self._ref_is_flip[ids].reshape(-1, 1)
+            amp = torch.where(is_flip, flip_amp, sine_amp)
+            freq = torch.where(is_flip, flip_freq, sine_freq)
+            t = (self.episode_length_buf[ids].to(torch.float32) * float(self.sim.cfg.dt)).unsqueeze(-1)  # (M,1)
+            rpy = amp * torch.sin(2.0 * math.pi * freq * t + self._ref_phase[ids])  # (M,3)
+            self._goal[ids, 0:4] = math_utils.quat_from_euler_xyz(rpy[:, 0], rpy[:, 1], rpy[:, 2])
+            if hold_mask is not None and torch.any(hold_mask):
+                sub_ids = ids[hold_mask]
+                self._goal[sub_ids, 0:4] = 0.0
+                self._goal[sub_ids, 0] = 1.0
+            return
+        else:
+            amp_value = self.cfg.ref_sine_amp
+            freq_value = self.cfg.ref_sine_freq
+        amp = torch.as_tensor(amp_value, device=self.device, dtype=torch.float32).reshape(1, 3)
+        freq = torch.as_tensor(freq_value, device=self.device, dtype=torch.float32).reshape(1, 3)
         t = (self.episode_length_buf[ids].to(torch.float32) * float(self.sim.cfg.dt)).unsqueeze(-1)  # (M,1)
         rpy = amp * torch.sin(2.0 * math.pi * freq * t + self._ref_phase[ids])  # (M,3)
         self._goal[ids, 0:4] = math_utils.quat_from_euler_xyz(rpy[:, 0], rpy[:, 1], rpy[:, 2])
+        if hold_mask is not None and torch.any(hold_mask):
+            sub_ids = ids[hold_mask]
+            self._goal[sub_ids, 0:4] = 0.0
+            self._goal[sub_ids, 0] = 1.0
 
     def _reset_domain(self, env_ids: Sequence[int]):
         env_ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
@@ -1323,9 +1743,48 @@ class EasyUUVEnv(DirectRLEnv):
 
         return radii * coords
 
+    def _so3_attitude_error(self):
+        """SO(3) 流形姿态误差（body frame），供 3D 向量化 S 面使用。
+
+        放弃欧拉角逐轴解耦：直接在四元数流形上取 body-frame 姿态误差 e_R 与角速度
+        误差 e_omega，规避 ±π 倒置区的万向节锁与通道耦合破产。
+
+        约定「误差 = 目标 − 当前」，故 e_R 与 e_omega 都是**修正方向**，与
+        `_pid_control` 中 `inner = ζ1·e_R + ζ2·e_omega` 的 + 号配合即为标准 PD
+        （+e_R 角度纠偏，+e_omega 角速度阻尼）。注意：诊断报告里写的
+        e_ω = ω_body − ω_desired 配 + 号会变成反阻尼（自激），这里取其相反数
+        e_omega = ω_desired − ω_body 以保证纯解析基线（geo_residual_scale=0）稳定。
+
+        Returns:
+            e_R     (N, 3): body-frame 姿态误差 = 2·sgn(w)·vec(q_curr⁻¹ ⊗ q_goal)。
+            e_omega (N, 3): body-frame 角速度误差 = ω_desired − ω_body；ω_desired 由
+                            相邻两步 goal 四元数有限差分得到（首步 _goal_prev=goal → 0）。
+        """
+        q_curr = self._robot.data.root_quat_w   # (N, 4) wxyz, body->world
+        q_goal = self._goal[:, 0:4]             # (N, 4) wxyz
+        # body-frame 姿态误差：q_err = q_curr⁻¹ ⊗ q_goal，其虚部即 current→desired 的转轴。
+        q_err = quat_mul(quat_conjugate(q_curr), q_goal)
+        sgn_e = torch.where(
+            q_err[:, 0:1] >= 0.0,
+            torch.ones_like(q_err[:, 0:1]),
+            -torch.ones_like(q_err[:, 0:1]),
+        )  # 强制最短路径，且在 180° (w=0) 处不退化为 0
+        e_R = 2.0 * sgn_e * q_err[:, 1:4]
+        # 参考角速度 ω_desired：相邻两步 goal 四元数有限差分（慢参考下量级很小，主作用为阻尼）。
+        ctrl_dt = float(self.sim.cfg.dt) * float(getattr(self.cfg, "decimation", 1))
+        q_rel = quat_mul(quat_conjugate(self._goal_prev), q_goal)
+        sgn_r = torch.where(
+            q_rel[:, 0:1] >= 0.0,
+            torch.ones_like(q_rel[:, 0:1]),
+            -torch.ones_like(q_rel[:, 0:1]),
+        )
+        omega_d = 2.0 * sgn_r * q_rel[:, 1:4] / ctrl_dt
+        e_omega = omega_d - self._robot.data.root_ang_vel_b
+        return e_R, e_omega
+
     def _pid_control(self, actions, actions_d, actions_i) -> torch.Tensor:
         # 将action修改为PID控制，随后输出PWM波的正规化频率。
-        motorValue = torch.zeros(self.num_envs, 8, device=self.device)
+        motorValue = torch.zeros(self.num_envs, self._num_thrusters, device=self.device)
         if not self.cfg.cascade_control:
             # RL direct PWM duty cycle path: use policy outputs directly as the four control channels.
             PID_value = torch.clip(actions, -1, 1)
@@ -1336,11 +1795,26 @@ class EasyUUVEnv(DirectRLEnv):
             # 更改为S面控制
             if self.cfg.control_method == 'Ssurface':
                 coeff_ratio = self.cfg.s_ratio
-                PID_value = 2 / (1 + torch.exp(-self.cfg.s_ratio *  self.PID_args[:,:,0] * actions - self.cfg.s_ratio * self.PID_args[:,:,1] * actions_d)) - 1
+                # M3 CM-C: s_surface_struct 失配——缩放 sigmoid 斜率 (s_ratio) 与加性项权威。
+                s_ratio_eff = self.cfg.s_ratio * float(getattr(self, "_mismatch_s_ratio_scale", 1.0))
+                PID_value = 2 / (1 + torch.exp(-s_ratio_eff *  self.PID_args[:,:,0] * actions - s_ratio_eff * self.PID_args[:,:,1] * actions_d)) - 1
                 if getattr(self.cfg, "self_adapt", False):
-                    PID_value_add = 30 * (1 / 60) * (actions + 1.00 * actions_d)
+                    add_scale = float(getattr(self, "_mismatch_add_scale", 1.0))
+                    PID_value_add = 30 * (1 / 60) * (actions + 1.00 * actions_d) * add_scale
                     PID_value_add = torch.clamp(PID_value_add, -0.35, 0.35)
                     PID_value += PID_value_add
+                # SO(3) 流形 S 面：在四元数误差流形上重算 roll/pitch/yaw 三轴（覆盖 0:3），
+                # depth（通道 3）保持上面的旧逐轴逻辑不变。规避欧拉奇异 + 通道解耦。
+                if getattr(self.cfg, "attitude_error_mode", "euler") == "so3":
+                    e_R, e_omega = self._so3_attitude_error()
+                    geo_z1 = float(getattr(self.cfg, "geo_zeta1", 1.0))
+                    geo_z2 = float(getattr(self.cfg, "geo_zeta2", 0.5))
+                    res_scale = float(getattr(self.cfg, "geo_residual_scale", 0.0))
+                    # 残差 RL：actions 已 ×action_lim（见上），让策略在解析基线上学修正（保 12 维 obs）。
+                    inner = geo_z1 * e_R + geo_z2 * e_omega + res_scale * actions[:, 0:3]
+                    s_surf = 2 / (1 + torch.exp(-s_ratio_eff * inner)) - 1
+                    # 固定分配矩阵对 roll/yaw 通道反号，乘 restoring 符号向量修正（见 cfg geo_channel_sign）。
+                    PID_value[:, 0:3] = s_surf * self._geo_channel_sign
             elif self.cfg.control_method == 'PID':
                 PID_value = actions * self.PID_args[:,:,0] + actions_d * self.PID_args[:,:,1] + actions_i * self.PID_args[:,:,2]
             else:
@@ -1351,14 +1825,26 @@ class EasyUUVEnv(DirectRLEnv):
         yaw控制 => 4到7,当error为正，即希望AUV从上看逆时针旋转，左前和右后(4、7)输出正，右前和左后(5、6)输出负
         深度控制 => 0到3，要求下沉(我们定义error = depth_desire - depth_real,换言之error为正)输出PID为正，反之为负
         '''
-        motorValue[:,0] = -PID_value[:,0] - PID_value[:,1] + PID_value[:,3] # roll, pitch, depth
-        motorValue[:,1] = PID_value[:,0] - PID_value[:,1] + PID_value[:,3]
-        motorValue[:,2] = -PID_value[:,0] + PID_value[:,1] + PID_value[:,3]
-        motorValue[:,3] = PID_value[:,0] + PID_value[:,1] + PID_value[:,3]
-        motorValue[:,4] = PID_value[:,2];
-        motorValue[:,5] = -PID_value[:,2]
-        motorValue[:,6] = -PID_value[:,2]
-        motorValue[:,7] = PID_value[:,2]
+        # === 分配路径分叉（Step 3d）===
+        # 旧硬编码 8 推混合块（base/asym/long_body/heavy_*，_use_config_alloc=False，A4 零变更）
+        # vs. config 驱动 B⁺（uuv6/uuv4/uuv6_angled/uuv4_angled，任意 N 推、非正交/欠驱动）。
+        if not self._use_config_alloc:
+            # M3 CM-D: allocation_skew 失配——逐控制通道缩放分配权重（模拟推进器安装/分配偏差）。仅旧路径生效。
+            if self.cfg.cascade_control and self.ctrl_mismatch_mode == "allocation_skew":
+                PID_value = PID_value * self._mismatch_alloc_scale
+            motorValue[:,0] = -PID_value[:,0] - PID_value[:,1] + PID_value[:,3] # roll, pitch, depth
+            motorValue[:,1] = PID_value[:,0] - PID_value[:,1] + PID_value[:,3]
+            motorValue[:,2] = -PID_value[:,0] + PID_value[:,1] + PID_value[:,3]
+            motorValue[:,3] = PID_value[:,0] + PID_value[:,1] + PID_value[:,3]
+            motorValue[:,4] = PID_value[:,2];
+            motorValue[:,5] = -PID_value[:,2]
+            motorValue[:,6] = -PID_value[:,2]
+            motorValue[:,7] = PID_value[:,2]
+        else:
+            # config B⁺ 路径：控制通道 [roll,pitch,yaw,depth] -> body wrench -> 伪逆分配到 N 推力。
+            # 非正交/欠驱动耦合由 B⁺（+ wls 权重屏蔽不可控 DOF）吸收，控制律不改。
+            wrench = control_channels_to_wrench(PID_value)
+            motorValue = allocate_thrust(self._alloc_B, wrench, self._alloc_mode, self._alloc_weight)
         motorValue = torch.clip(motorValue, -1, 1).to(self.device) # clip to PWM values
         # STDW wrapper hook: cache low-level adaptation correction (PID_value_add) for pseudo-action.
         if 'PID_value_add' in locals():
@@ -1387,8 +1873,8 @@ class EasyUUVEnv(DirectRLEnv):
 
         if self._debug: print("actions: ", actions)
 
-        thruster_forces = torch.zeros((self.num_envs, 8, 3), device=self.device, dtype=torch.float)
-        thruster_torques = torch.zeros((self.num_envs, 8, 3), device=self.device, dtype=torch.float)
+        thruster_forces = torch.zeros((self.num_envs, self._num_thrusters, 3), device=self.device, dtype=torch.float)
+        thruster_torques = torch.zeros((self.num_envs, self._num_thrusters, 3), device=self.device, dtype=torch.float)
 
         # 修改：action不再输出motorValue,而是输出PWM数值
         # A3：D 项使用真实 body 角速度（roll/pitch/yaw 三轴），depth 维保留动作差分。
@@ -1449,6 +1935,20 @@ class EasyUUVEnv(DirectRLEnv):
                     self.thruster_efficiency_factors[:, thruster_idx] = degradation.squeeze(-1)
         else:
             self.thruster_efficiency_factors.fill_(1.0)
+
+        # M3 CM-B: actuator_scale 失配——在 efficiency reset 之后乘入持久推力失配，
+        # 作用于 motorValue→thrust 线性段，绕开 sigmoid 饱和（默认全 1.0 恒等）。
+        if self.ctrl_mismatch_mode == "actuator_scale":
+            self.thruster_efficiency_factors = self.thruster_efficiency_factors * self._mismatch_actuator_scale
+
+        # M4 B3 推进器吸气——露出水面的推进器按浸没比例折减推力权威（默认 off → 全 1.0 恒等）。
+        if self.boundary_models.enable_ventilation:
+            vent = self.boundary_models.compute_ventilation_factor(
+                root_pos_w=self._robot.data.root_pos_w,
+                root_quat_w=self._robot.data.root_quat_w,
+                thruster_com_offsets=self.thruster_com_offsets,
+            )
+            self.thruster_efficiency_factors = self.thruster_efficiency_factors * vent
 
         threshold = 0.02
         motorValues[torch.abs(motorValues) < threshold] = 0 
@@ -1512,6 +2012,24 @@ class EasyUUVEnv(DirectRLEnv):
 
         forces = density_forces + buoyancy_forces + viscosity_forces + thruster_forces
         torques = density_torques + buoyancy_torques + viscosity_torques + thruster_torques
+
+        # M4 近边界效应——加性 body-frame wrench 修正（默认 off → any_enabled=False → 零修正）。
+        if self.boundary_models.any_enabled:
+            b_df, b_dt, b_info = self.boundary_models.compute_boundary_wrench(
+                root_pos_w=self._robot.data.root_pos_w,
+                root_quat_w=self._robot.data.root_quat_w,
+                masses=self.masses,
+                com_to_cob_offsets=self.com_to_cob_offsets,
+                g_mag=abs(self._gravity_magnitude),
+                buoyancy_forces_b=buoyancy_forces,
+                buoyancy_torques_b=buoyancy_torques,
+                drag_forces_b=density_forces + viscosity_forces,
+                drag_torques_b=density_torques + viscosity_torques,
+            )
+            forces = forces + b_df
+            torques = torques + b_dt
+            self._last_boundary_info = b_info
+
         torques = self._update_runtime_torque_pulse(torques)
 
         if self._debug: print("final forces", forces)

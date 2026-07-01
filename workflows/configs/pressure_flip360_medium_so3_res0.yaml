@@ -1,0 +1,27 @@
+env:
+  tune_gains: true
+  identity_init: false
+  enable_pe: true
+  enable_deadzone: true
+  enable_param_lpf: true
+  # === 纯解析 SO(3) 姿态基线（诊断用，res=0）===
+  # geo_residual_scale=0 ⇒ RL 残差被完全关闭，roll/pitch/yaw 由纯几何 PD 驱动。
+  # 配合加载 model_2846，depth 通道仍走旧 euler 路径 = 已知良好的 depth 控制器。
+  # 目的：隔离几何 S 面控制器本身的质量，剔除 fine-tune 混沌训练的混淆。
+  attitude_error_mode: so3
+  action_lim_vec: [0.6, 0.6, 0.3, 1.0]
+  geo_zeta1: 1.0
+  geo_zeta2: 0.5
+  geo_residual_scale: 0.0
+  reference_mode: flip360_sine
+  ref_sine_amp: [3.1415926, 3.1415926, 0.0]
+  ref_sine_freq: [0.05, 0.05, 0.0]
+  disturbance_cfg:
+    mode: jonswap
+    base_vel: [0.08, 0.0, 0.03]
+    jonswap_hs: 0.8
+    jonswap_fp: 0.14
+    jonswap_gamma: 3.3
+    jonswap_depth: 30.0
+    jonswap_direction: 0.0
+    jonswap_seed: 11
